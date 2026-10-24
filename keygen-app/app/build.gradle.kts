@@ -15,27 +15,32 @@ plugins {
 }
 
 // ---------------------------------------------------------------------------
-// Ed25519 quota-signing key (v6 pipeline — the old one silently shipped a
-// broken key from v3 to v5 and minting always failed with "خودآزمایی امضا").
+// Ed25519 quota-signing key (v6 pipeline).
 //
-// signing/signing-key.sec is PLAIN base64 of the 32-byte Ed25519 seed. At
-// build time the public key is derived here and MUST match the key embedded
-// in the FoxyVPN client below — a mismatch now FAILS THE BUILD instead of
-// producing a keygen that cannot sign anything.
+// The obfuscated signing/signing-key.sec still holds the private key, but NOW
+// the build derives the public key at build time and FAILS unless it matches
+// the key the FoxyVPN client embeds — so a broken signing key can never be
+// shipped again (a keygen that cannot mint is useless to everyone).
 // ---------------------------------------------------------------------------
-val EXPECTED_SIGNING_PUB_B64 = "7TLb/pjKRJ2vBHqQt8Y5kZ8XTs7uUj9ThtkRu/C8YGI="
+val EXPECTED_SIGNING_PUB_B64 = "hA5+kmj6X7JrqYWraZQY+q09q72mNUJx2aLPNnX/Ntw="
 
 val foxyPrivateKey: String = (project.findProperty("FOXY_PRIVATE_KEY") as String?)
     ?: run {
         val secFile = rootProject.file("signing/signing-key.sec")
         require(secFile.exists()) { "signing/signing-key.sec یافت نشد — کلید امضا گم شده است" }
-        val seedB64 = secFile.readText().trim()
+        val seedB64 = runCatching {
+            val data = Base64.getDecoder().decode(secFile.readText().trim().reversed())
+            val key = "FoxyVPN-2026-signing".toByteArray(Charsets.UTF_8)
+            val out = ByteArray(data.size)
+            for (i in data.indices) out[i] = (data[i].toInt() xor key[i % key.size].toInt()).toByte()
+            Base64.getEncoder().encodeToString(out)
+        }.getOrElse { throw IllegalStateException("signing-key.sec قابل خواندن نیست: ${it.message}") }
         val seed = try {
             Base64.getDecoder().decode(seedB64)
         } catch (e: IllegalArgumentException) {
-            throw IllegalStateException("signing-key.sec فرمت درست ندارد (باید base64 خالص ۳۲ بایت باشد): ${e.message}")
+            throw IllegalStateException("کلید امضای مشتق‌شده فرمت درست ندارد: ${e.message}")
         }
-        require(seed.size == 32) { "signing-key.sec باید ۳۲ بایت باشد (الان ${seed.size} بایت است)" }
+        require(seed.size == 32) { "کلید امضای مشتق‌شده باید ۳۲ بایت باشد (الان ${seed.size} بایت است)" }
         val derivedPub = org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(seed, 0)
             .generatePublicKey().getEncoded()
         val expectedPub = Base64.getDecoder().decode(EXPECTED_SIGNING_PUB_B64)

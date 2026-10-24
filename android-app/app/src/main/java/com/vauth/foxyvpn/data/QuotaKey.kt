@@ -52,7 +52,7 @@ object QuotaKeyCodec {
 
     /** Ed25519 public key of the current FoxyKeygen release (base64, 32 bytes). */
     const val PUB_B64 =
-        "7TLb/pjKRJ2vBHqQt8Y5kZ8XTs7uUj9ThtkRu/C8YGI="
+        "hA5+kmj6X7JrqYWraZQY+q09q72mNUJx2aLPNnX/Ntw="
 
     /**
      * Every signing public key this build accepts: the current one first,
@@ -61,7 +61,6 @@ object QuotaKeyCodec {
      */
     val PUB_B64_LIST = listOf(
         PUB_B64,
-        "hA5+kmj6X7JrqYWraZQY+q09q72mNUJx2aLPNnX/Ntw=", // v2.3.0 era
         "XxKVqJEz37vADD0ctmZSGPgvnS/o+1FCFf7CB1J3++E=", // v2.1.0 era
         "8b705IT0MNKJEXm+zwlKjlGiFazvWIkIoIYLR12cAvE=", // original era
     )

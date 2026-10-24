@@ -26,7 +26,7 @@ data class QuotaKeyPayload(
 object QuotaKeyCodec {
 
     /** Must match the public key embedded in the FoxyVPN client. */
-    const val PUB_B64 = "7TLb/pjKRJ2vBHqQt8Y5kZ8XTs7uUj9ThtkRu/C8YGI="
+    const val PUB_B64 = "hA5+kmj6X7JrqYWraZQY+q09q72mNUJx2aLPNnX/Ntw="
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 

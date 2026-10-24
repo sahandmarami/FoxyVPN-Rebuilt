@@ -124,6 +124,15 @@ type Core struct {
         auth         *RuntimeAuth
         pendingToken string
 
+        key     *QuotaKeyPayload
+        keyRaw  string
+        usage   *UsageStore
+
+        pingMu        sync.Mutex
+        pingRunning   bool
+        pingBestMs    int
+        pingBestWhere string
+
         session        *TunnelSession
         connectedSince time.Time
         exitIP         string
@@ -172,11 +181,13 @@ func NewCore(cfg CoreConfig, logger *Logger) (*Core, error) {
                 state:    StateNeedLogin,
         }
         c.servers = NewServerList(filepath.Join(cfg.DataDir, "vpn_serverlist_cache.json"))
+        c.usage = NewUsageStore(cfg.DataDir)
 
         if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
                 return nil, err
         }
         c.loadStore()
+        go c.usageLoop()
 
         c.proxy = NewLocalProxy(cfg.Bind, cfg.SocksPort, cfg.HttpPort, c.resolver, c.counters)
         c.proxy.SetSession(func() (streamOpener, bool) {
@@ -203,11 +214,13 @@ func NewCore(cfg CoreConfig, logger *Logger) (*Core, error) {
 // ---------- persistence ----------
 
 type storeFile struct {
-        Auth         *RuntimeAuth `json:"auth,omitempty"`
-        PendingToken string       `json:"pending_token,omitempty"`
-        SysProxy     *bool        `json:"sys_proxy,omitempty"`
-        Country      string       `json:"country,omitempty"`
-        City         string       `json:"city,omitempty"`
+        Auth         *RuntimeAuth    `json:"auth,omitempty"`
+        PendingToken string          `json:"pending_token,omitempty"`
+        SysProxy     *bool           `json:"sys_proxy,omitempty"`
+        Country      string          `json:"country,omitempty"`
+        City         string          `json:"city,omitempty"`
+        KeyRaw       string          `json:"key_raw,omitempty"`
+        KeyPayload   *QuotaKeyPayload `json:"key_payload,omitempty"`
 }
 
 func (c *Core) storePath() string { return filepath.Join(c.cfg.DataDir, "tokens.json") }
@@ -228,8 +241,13 @@ func (c *Core) loadStore() {
         }
         c.chosenCountry = st.Country
         c.chosenCity = st.City
+        c.keyRaw = st.KeyRaw
+        c.key = st.KeyPayload
         if c.auth != nil {
                 c.email = c.auth.Email
+        }
+        if c.key != nil {
+                c.usage.Attach(c.key.Id)
         }
 }
 
@@ -239,6 +257,8 @@ func (c *Core) saveStore() {
                 PendingToken: c.pendingToken,
                 Country:      c.chosenCountry,
                 City:         c.chosenCity,
+                KeyRaw:       c.keyRaw,
+                KeyPayload:   c.key,
         }
         sysProxy := c.autoSysProxy
         st.SysProxy = &sysProxy
@@ -251,6 +271,8 @@ func (c *Core) clearStore() {
         c.auth = nil
         c.pendingToken = ""
         c.email = ""
+        c.key = nil
+        c.keyRaw = ""
 }
 
 // ---------- session bootstrap ----------
@@ -260,7 +282,14 @@ func (c *Core) RestoreSession() {
         auth := c.auth
         c.mu.Unlock()
         if auth == nil {
-                c.log.Infof("no stored session; sign-in required")
+                c.log.Infof("no stored session; the activation key must be entered")
+                return
+        }
+        if c.keyExpired() {
+                c.log.Warnf("the stored key has expired; connect is disabled until a new key is activated")
+                c.mu.Lock()
+                c.state = StateDisconnected
+                c.mu.Unlock()
                 return
         }
         now := nowUnix()
@@ -277,6 +306,7 @@ func (c *Core) RestoreSession() {
                 c.state = StateDisconnected
                 c.mu.Unlock()
                 c.log.Infof("session restored for %s", safeEmail(c.email))
+                go c.refreshEntitlement()
                 return
         }
         c.mu.Lock()
@@ -306,9 +336,86 @@ func (c *Core) RestoreSession() {
         c.saveStore()
         c.mu.Unlock()
         c.log.Infof("session renewed for %s", safeEmail(c.email))
+        go c.refreshEntitlement()
 }
 
-// ---------- login flow ----------
+// ---------- key activation (quota-key flow) ----------
+
+// keyExpired reports whether the stored/pending key has passed its expiry.
+func (c *Core) keyExpired() bool {
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        return c.key != nil && c.key.Exp > 0 && c.key.Exp <= nowUnix()
+}
+
+// ActivateKey implements the exact flow of the Android KeyEntryScreen:
+// verify the FV1 signature, bring the FxA session behind the key alive via
+// the refresh-token grant, then accept the key and persist it.
+func (c *Core) ActivateKey(rawKey string) error {
+        c.mu.Lock()
+        if c.state == StateConnecting || c.state == StateConnected {
+                c.mu.Unlock()
+                return errors.New("ابتدا اتصال را قطع کنید")
+        }
+        c.mu.Unlock()
+
+        payload, cleaned, err := parseQuotaKey(rawKey)
+        if err != nil {
+                c.log.Warnf("key rejected: %v", err)
+                return err
+        }
+
+        auth, err := c.fxa.refresh(payload.Rt)
+        if err != nil {
+                c.log.Errorf("key activation failed: %v", err)
+                return &friendlyError{friendlyActivationError(err)}
+        }
+
+        c.mu.Lock()
+        c.auth = auth
+        c.email = ""
+        c.pendingToken = ""
+        c.key = payload
+        c.keyRaw = cleaned
+        c.state = StateDisconnected
+        c.saveStore()
+        c.usage.Attach(payload.Id)
+        c.mu.Unlock()
+        c.usage.Flush()
+        c.log.Infof("key %s activated for %s", payload.Id, safeName(payload.personName()))
+
+        go c.refreshEntitlement()
+        return nil
+}
+
+// RemoveKey signs out and forgets the key (Android: Sign out).
+func (c *Core) RemoveKey() error {
+        c.Disconnect()
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.clearStore()
+        c.state = StateNeedLogin
+        c.usage = NewUsageStore(c.cfg.DataDir)
+        c.log.Infof("key removed")
+        return nil
+}
+
+type friendlyError struct{ msg string }
+
+func (e *friendlyError) Error() string { return e.msg }
+
+func safeName(name string) string {
+        r := []rune(strings.TrimSpace(name))
+        if len(r) == 0 {
+                return "کاربر"
+        }
+        if len(r) <= 2 {
+                return string(r)
+        }
+        return string(r[:2]) + "…"
+}
+
+// ---------- login flow (kept for CLI/debug parity) ----------
 
 func (c *Core) Login(email, password string) error {
         c.mu.Lock()
@@ -378,13 +485,132 @@ func (c *Core) Verify2FA(code string) error {
 }
 
 func (c *Core) Logout() error {
-        c.Disconnect()
-        c.mu.Lock()
-        defer c.mu.Unlock()
-        c.clearStore()
-        c.state = StateNeedLogin
-        c.log.Infof("signed out")
-        return nil
+        return c.RemoveKey()
+}
+
+// ---------- usage accounting loop ----------
+
+// usageLoop folds the live traffic counters into the persistent per-key
+// usage store every few seconds so «مصرف شده» survives restarts.
+func (c *Core) usageLoop() {
+        ticker := time.NewTicker(3 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+                c.mu.Lock()
+                connected := c.state == StateConnected
+                up := c.counters.Up.Load()
+                down := c.counters.Down.Load()
+                usage := c.usage
+                c.mu.Unlock()
+                if connected && usage != nil {
+                        usage.AddDelta(up, down)
+                }
+        }
+}
+
+// ---------- ping-all (home «تست پینگ همه» pill) ----------
+
+// StartPingAll measures the TCP latency of the first city of up to 12
+// countries and remembers the best result — the Windows counterpart of the
+// Android PingUtil ping-all sweep.
+func (c *Core) StartPingAll() {
+        c.pingMu.Lock()
+        if c.pingRunning {
+                c.pingMu.Unlock()
+                return
+        }
+        c.pingRunning = true
+        c.pingMu.Unlock()
+
+        go func() {
+                defer func() {
+                        c.pingMu.Lock()
+                        c.pingRunning = false
+                        c.pingMu.Unlock()
+                }()
+
+                countries, err := c.servers.Refresh(false)
+                if err != nil || len(countries) == 0 {
+                        return
+                }
+                if len(countries) > 12 {
+                        countries = countries[:12]
+                }
+                best, bestWhere := 0, ""
+                for _, country := range countries {
+                        var host string
+                        var port int
+                        for _, city := range country.Cities {
+                                for _, srv := range city.Servers {
+                                        if !srv.Quarantined {
+                                                host, port = srv.Hostname, srv.Port
+                                                break
+                                        }
+                                }
+                                if host != "" {
+                                        break
+                                }
+                        }
+                        if host == "" {
+                                continue
+                        }
+                        ms := c.measureTCPLatency(host, port)
+                        where := country.Name
+                        if ms > 0 && (best == 0 || ms < best) {
+                                best, bestWhere = ms, where
+                        }
+                        select {
+                        case <-c.stopCh:
+                                return
+                        default:
+                        }
+                }
+                if best > 0 {
+                        c.pingMu.Lock()
+                        c.pingBestMs, c.pingBestWhere = best, bestWhere
+                        c.pingMu.Unlock()
+                }
+        }()
+}
+
+func (c *Core) measureTCPLatency(host string, port int) int {
+        target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+        if ip, ok := c.resolver.EdgeAddress(host); ok {
+                target = net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+        }
+        start := time.Now()
+        conn, err := net.DialTimeout("tcp", target, 2500*time.Millisecond)
+        if err != nil {
+                return 0
+        }
+        _ = conn.Close()
+        ms := int(time.Since(start).Milliseconds())
+        if ms < 1 {
+                ms = 1
+        }
+        return ms
+}
+
+// PingProbe measures a single city's first server — the server-list rows.
+func (c *Core) PingProbe(countryCode, cityCode string) int {
+        countries := c.servers.Countries()
+        for _, country := range countries {
+                if country.Code != countryCode {
+                        continue
+                }
+                for _, city := range country.Cities {
+                        if city.Code != cityCode {
+                                continue
+                        }
+                        for _, srv := range city.Servers {
+                                if srv.Quarantined {
+                                        continue
+                                }
+                                return c.measureTCPLatency(srv.Hostname, srv.Port)
+                        }
+                }
+        }
+        return 0
 }
 
 func (c *Core) hasValidAccessToken() bool {
@@ -446,6 +672,10 @@ func (c *Core) mintProxyPass() (*ProxyPass, error) {
 
 func (c *Core) Connect(country, city string) error {
         c.mu.Lock()
+        if c.key != nil && c.key.Exp > 0 && c.key.Exp <= nowUnix() {
+                c.mu.Unlock()
+                return errors.New("این کلید منقضی شده است؛ کلید جدید فعال کنید")
+        }
         switch c.state {
         case StateConnected:
                 c.mu.Unlock()
@@ -751,6 +981,7 @@ func (c *Core) Disconnect() {
         if sess != nil {
                 sess.Close()
         }
+        c.usage.Flush()
         c.log.Infof("disconnected")
 }
 
@@ -867,6 +1098,22 @@ type Snapshot struct {
         UIPort      int          `json:"ui_port"`
         TLSSplit    string       `json:"tls_split"`
         LastError   string       `json:"last_error,omitempty"`
+
+        // quota-key context (Android HomeScreen account card)
+        HasKey     bool   `json:"has_key"`
+        KeyName    string `json:"key_name,omitempty"`
+        KeyID      string `json:"key_id,omitempty"`
+        PlanGb     int64  `json:"plan_gb"`
+        PlanMb     int64  `json:"plan_mb"`
+        KeyExp     int64  `json:"key_exp"`
+        KeyExpired bool   `json:"key_expired"`
+        LimitBytes int64  `json:"limit_bytes"`
+        UsedBytes  int64  `json:"used_bytes"`
+        ResetAt    int64  `json:"reset_at"`
+
+        PingRunning   bool   `json:"ping_running"`
+        PingBestMs    int    `json:"ping_best_ms"`
+        PingBestWhere string `json:"ping_best_where,omitempty"`
 }
 
 func (c *Core) Snapshot() Snapshot {
@@ -898,6 +1145,46 @@ func (c *Core) Snapshot() Snapshot {
         }
         s.UpBytes = c.counters.Up.Load()
         s.DownBytes = c.counters.Down.Load()
+
+        // key context
+        if c.key != nil {
+                s.HasKey = true
+                s.KeyName = c.key.personName()
+                s.KeyID = c.key.Id
+                s.PlanGb, s.PlanMb = c.key.Gb, c.key.Mb
+                s.KeyExp = c.key.Exp
+                s.KeyExpired = c.key.Exp > 0 && c.key.Exp <= nowUnix()
+        }
+        // usage: prefer the plan from the key, then Guardian's authoritative
+        // X-Quota numbers; fall back to the local persistent counter.
+        plan := int64(0)
+        if c.key != nil {
+                plan = c.key.planBytes()
+        }
+        s.LimitBytes = plan
+        if ent := c.entitlement; ent != nil && ent.MaxBytes != nil && *ent.MaxBytes > 0 {
+                if plan <= 0 || *ent.MaxBytes > plan {
+                        s.LimitBytes = *ent.MaxBytes
+                }
+        }
+        used := c.usage.Used()
+        if ent := c.entitlement; ent != nil && ent.QuotaRemaining != nil && s.LimitBytes > 0 {
+                serverUsed := s.LimitBytes - *ent.QuotaRemaining
+                if serverUsed > used {
+                        used = serverUsed
+                }
+        }
+        s.UsedBytes = used
+        if r := c.usage.ResetAt(); r > 0 {
+                s.ResetAt = r
+        }
+        if c.currentPass != nil && c.currentPass.QuotaReset != nil {
+                s.ResetAt = *c.currentPass.QuotaReset
+        }
+
+        c.pingMu.Lock()
+        s.PingRunning, s.PingBestMs, s.PingBestWhere = c.pingRunning, c.pingBestMs, c.pingBestWhere
+        c.pingMu.Unlock()
         return s
 }
 
@@ -922,6 +1209,7 @@ func (c *Core) ShutdownQuick() {
         if sess != nil {
                 sess.Close()
         }
+        c.usage.Flush()
 }
 
 // ---------- server options / logs for the UI ----------

@@ -24,6 +24,7 @@ import com.vauth.foxyvpn.data.FxaAuthRepository
 import com.vauth.foxyvpn.data.GUARDIAN_ENDPOINT_DEFAULT
 import com.vauth.foxyvpn.data.GistReporter
 import com.vauth.foxyvpn.data.GuardianClient
+import com.vauth.foxyvpn.data.GuardianHttpError
 import com.vauth.foxyvpn.data.ProxyPass
 import com.vauth.foxyvpn.data.ProxyStateStore
 import com.vauth.foxyvpn.data.QuotaExceededError
@@ -1092,6 +1093,14 @@ class FoxyVpnService : VpnService() {
     private fun friendlyErrorMessage(error: Throwable): String = when (error) {
         is QuotaExceededError -> "Your VPN quota is exhausted. Try again later."
         is TokenInvalidError -> "Your session was rejected. Please sign in again."
+        is GuardianHttpError -> when (error.statusCode) {
+            401 -> "Mozilla rejected this session (HTTP 401). Sign in again."
+            402 -> "Mozilla has not granted this account VPN access (HTTP 402). Brand-new accounts may need their email verified first."
+            403 -> "Mozilla refused this request (HTTP 403). The account may be brand-new or temporarily limited."
+            404 -> "Mozilla's quota service did not find this account (HTTP 404)."
+            429 -> "Too many requests (HTTP 429). Try again in a few minutes."
+            else -> error.message ?: "The VPN service refused the connection."
+        }
         is TimeoutCancellationException -> "the connection timed out"
         else -> {
             val untrusted = generateSequence(error) { it.cause }.take(8).any {

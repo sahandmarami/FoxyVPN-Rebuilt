@@ -77,6 +77,11 @@ class FxaAuthRepository(
         get() = tokenStore.pendingSessionToken
         set(value) { tokenStore.pendingSessionToken = value }
 
+    /** why the last startLogin asked for a code: "account" (the account's
+     *  e-mail itself is unverified) vs "login" (risk-based sign-in code). */
+    var lastVerificationReason: String? = null
+        private set
+
     fun clearPendingSession() {
         tokenStore.pendingSessionToken = null
     }
@@ -94,6 +99,7 @@ class FxaAuthRepository(
         val data = loginAttempt(cleanEmail, password)
         val sessionToken = data.getString("sessionToken")
         pendingSessionToken = sessionToken
+        lastVerificationReason = data.optString("verificationReason").ifBlank { null }
         val verified = data.optBoolean("verified", false)
         if (!verified) {
             true
@@ -102,6 +108,17 @@ class FxaAuthRepository(
             clearPendingSession()
             false
         }
+    }
+
+    /**
+     * FxA re-sends the account-confirmation / sign-in code for the pending
+     * session — the login screens use it for «ایمیل نرسید».
+     */
+    suspend fun resendVerificationEmail(): Result<Unit> = runCatching {
+        val sessionToken = pendingSessionToken
+            ?: error("No pending FxA session. Start sign-in again.")
+        fxaDo("POST", "/recovery_email/resend_code", sessionToken = sessionToken, jsonBody = JSONObject())
+        Unit
     }
 
     suspend fun submitTwoFactorCode(code: String): Result<Boolean> = runCatching {

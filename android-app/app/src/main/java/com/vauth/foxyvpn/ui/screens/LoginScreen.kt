@@ -20,6 +20,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,6 +50,7 @@ fun LoginScreen(
     var code by rememberSaveable { mutableStateOf("") }
     var awaitingTwoFactor by rememberSaveable { mutableStateOf(authRepository.pendingSessionToken != null) }
     var isLoading by remember { mutableStateOf(false) }
+    var resending by remember { mutableStateOf(false) }
     var errorMessage by rememberSaveable { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
@@ -70,7 +72,7 @@ fun LoginScreen(
             isLoading = false
             result.onSuccess { needsVerification ->
                 if (needsVerification) awaitingTwoFactor = true else onSignedIn()
-            }.onFailure { errorMessage = it.message ?: "Sign-in failed" }
+            }.onFailure { errorMessage = fxaLoginError(it) }
         }
     }
 
@@ -84,7 +86,7 @@ fun LoginScreen(
             isLoading = false
             result.onSuccess { onSignedIn() }
                 .onFailure {
-                    errorMessage = it.message ?: "Verification failed"
+                    errorMessage = fxaLoginError(it)
                     if (authRepository.pendingSessionToken == null) {
                         awaitingTwoFactor = false
                     }
@@ -174,7 +176,15 @@ fun LoginScreen(
                     }
                 }
             } else {
-                Text("Enter the confirmation code sent to your email", style = MaterialTheme.typography.bodyMedium)
+                val unverifiedAccount = authRepository.lastVerificationReason == "account"
+                Text(
+                    if (unverifiedAccount) {
+                        "This account's email is not confirmed yet. Open the inbox, read the \u00abVerify your account\u00bb email from Mozilla, tap its link \u2014 or enter its code here."
+                    } else {
+                        "Enter the confirmation code sent to your email"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
                 Spacer(Modifier.padding(top = 12.dp))
                 OutlinedTextField(
                     value = code,
@@ -195,7 +205,22 @@ fun LoginScreen(
                     ),
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Spacer(Modifier.padding(top = 20.dp))
+                TextButton(
+                    onClick = {
+                        if (resending) return@TextButton
+                        resending = true
+                        scope.launch {
+                            val r = authRepository.resendVerificationEmail()
+                            resending = false
+                            r.onSuccess { errorMessage = "Email re-sent — check the inbox (and the spam folder)." }
+                                .onFailure { errorMessage = "Could not re-send: ${it.message?.take(140)}" }
+                        }
+                    },
+                    enabled = !resending,
+                ) {
+                    Text(if (resending) "Re-sending\u2026" else "No email received? Re-send")
+                }
+                Spacer(Modifier.padding(top = 12.dp))
                 Button(
                     onClick = {
                         focusManager.clearFocus()
@@ -228,5 +253,40 @@ fun LoginScreen(
                 )
             }
         }
+    }
+}
+
+/**
+ * Clear English mapping of the Firefox Accounts failure classes — the raw
+ * server message alone ("Unverified account", "Request blocked") reads like
+ * a vague «مشکل داره» to the user.
+ */
+private fun fxaLoginError(error: Throwable): String {
+    if (error is com.vauth.foxyvpn.data.FxaApiError) {
+        return when {
+            error.errno == 102 ->
+                "No Firefox account exists with this email. Create one at accounts.firefox.com first, then sign in here."
+            error.errno == 103 ->
+                "Incorrect password. Try again."
+            error.errno == 104 ->
+                "This account's email is not verified yet. Open the inbox, open the \u00abVerify your account\u00bb email from Mozilla and tap its link, then sign in again."
+            error.errno == 114 || error.statusCode == 429 ->
+                "Too many sign-in attempts. Wait a few minutes and try again."
+            error.errno == 125 ->
+                "Mozilla blocked this request for security reasons. Try again later, or from a different network."
+            error.errno == 201 ->
+                "The Mozilla account service is temporarily unavailable. Try again later."
+            error.statusCode != null ->
+                "Sign-in failed: Mozilla answered HTTP ${error.statusCode}: ${error.message?.take(140)}"
+            else ->
+                "Sign-in failed: ${error.message?.take(140)}"
+        }
+    }
+    val msg = error.message.orEmpty()
+    return when {
+        msg.contains("timeout", true) || msg.contains("Unable to resolve", true) ||
+            msg.contains("Failed to connect", true) || msg.contains("Network", true) ->
+            "Could not reach the Mozilla account server — check your internet connection."
+        else -> msg.ifBlank { "Sign-in failed" }
     }
 }

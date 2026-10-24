@@ -101,10 +101,35 @@ class GuardianClient(
      * Account status + the metered-quota headers of a fresh proxy pass.
      * [Entitlement.quotaReset] carries the moment the monthly volume is
      * re-granted (unix seconds) so the dashboard can show the recharge day.
+     *
+     * BRAND-NEW ACCOUNTS: Guardian does not serve fpn/status for an account
+     * that was never activated — the main app activates right before its
+     * first connect, but an account added straight into the keygen never
+     * went through that step, so the quota card read «دریافت اطلاعات ناموفق»
+     * forever. If status is refused (402/403/404) or says subscribed=false,
+     * activate the entitlement once and read the status again.
      */
     suspend fun fetchAccountOverview(endpoint: String, accessToken: String): Entitlement = withContext(Dispatchers.IO) {
-        val entitlement = fetchUserInfo(endpoint, accessToken)
-        if (entitlement.quotaRemaining != null && entitlement.quotaReset != null) {
+        val first = runCatching { fetchUserInfo(endpoint, accessToken) }
+        val entitlement = when {
+            first.isSuccess -> first.getOrThrow()
+            shouldSelfActivate(first.exceptionOrNull()) -> {
+                // one activation attempt, then one status retry — if Mozilla
+                // still refuses, the real error of the RETRY is surfaced
+                val activated = runCatching { activateGuardian(endpoint, accessToken) }
+                activated.fold(
+                    onSuccess = { activatedEntitlement ->
+                        runCatching { fetchUserInfo(endpoint, accessToken) }
+                            .getOrElse { activatedEntitlement }
+                    },
+                    onFailure = { throw it },
+                )
+            }
+            else -> throw first.exceptionOrNull() ?: GuardianHttpError("unknown guardian failure")
+        }
+
+        val quotaReady = entitlement.quotaRemaining != null && entitlement.quotaReset != null
+        if (quotaReady && entitlement.subscribed) {
             entitlement
         } else {
             val pass = runCatching { fetchProxyPass(endpoint, accessToken) }.getOrNull()
@@ -114,6 +139,11 @@ class GuardianClient(
                 quotaReset = entitlement.quotaReset ?: pass.quotaReset,
             )
         }
+    }
+
+    private fun shouldSelfActivate(failure: Throwable?): Boolean {
+        val status = (failure as? GuardianHttpError)?.statusCode ?: return false
+        return status == 402 || status == 403 || status == 404
     }
 
     private suspend fun authorizedRequest(method: String, url: String, accessToken: String): Response {

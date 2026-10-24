@@ -81,6 +81,7 @@ import com.foxy.keygen.BuildConfig
 import com.foxy.keygen.data.AccountVault
 import com.foxy.keygen.data.ControlPlaneHttp
 import com.foxy.keygen.data.FaFormat
+import com.foxy.keygen.data.FxaApiError
 import com.foxy.keygen.data.FxaAuthRepository
 import com.foxy.keygen.data.GistRegistry
 import com.foxy.keygen.data.QuotaKeyCodec
@@ -142,6 +143,31 @@ fun KeygenRoot(app: KeygenApp) {
 
 // ---------------- login ----------------
 
+/**
+ * Persian, actionable mapping of the FxA failure classes — errno numbers are
+ * Firefox Accounts' own codes (api.accounts.firefox.com responses).
+ */
+private fun fxaLoginErrorFa(e: Throwable): String {
+    if (e is FxaApiError) {
+        return when {
+            e.errno == 102 -> "با این ایمیل حسابی در Mozilla ثبت نشده — اول در accounts.firefox.com اکانت بساز، بعد وارد شو"
+            e.errno == 103 -> "رمز عبور اشتباه است"
+            e.errno == 104 -> "ایمیل این اکانت هنوز تأیید نشده — ایمیل Mozilla را باز کن و لینک «تأیید حساب» را بزن، بعد دوباره وارد شو"
+            e.errno == 114 || e.statusCode == 429 -> "تلاش‌های ورود زیاد بوده — چند دقیقه صبر کن و دوباره امتحان کن"
+            e.errno == 125 -> "Mozilla این درخواست را به دلایل امنیتی بلاک کرد — کمی بعد، یا با اینترنت دیگری امتحان کن"
+            e.errno == 201 -> "سرور Mozilla در دسترس نیست — کمی بعد دوباره"
+            e.statusCode != null -> "خطای سرور Mozilla (HTTP ${e.statusCode}): ${e.message?.take(140)}"
+            else -> "ورود ناموفق بود: ${e.message?.take(140)}"
+        }
+    }
+    val msg = e.message.orEmpty()
+    return when {
+        msg.contains("timeout", true) || msg.contains("Unable to resolve", true) || msg.contains("Failed to connect", true) || msg.contains("Network", true) ->
+            "اتصال به سرور Mozilla برقرار نشد — اینترنت را بررسی کنید"
+        else -> msg.take(240).ifBlank { "ورود ناموفق بود" }
+    }
+}
+
 @Composable
 private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: () -> Unit) {
     val accent = rememberKeygenAccent()
@@ -150,6 +176,7 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
     var code by remember { mutableStateOf("") }
     var needCode by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+    var resending by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
@@ -200,6 +227,16 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
         )
         if (needCode) {
             Spacer(Modifier.height(10.dp))
+            val unverifiedAccount = app.authRepository.lastVerificationReason == "account"
+            Text(
+                if (unverifiedAccount)
+                    "ایمیل اکانتت را باز کن — Mozilla ایمیل «تأیید حساب» فرستاده؛ لینک داخلش را بزن و برگرد، یا کدش را همین‌جا وارد کن"
+                else
+                    "کد تایید ارسال‌شده به ایمیل را وارد کن",
+                fontSize = 12.sp,
+                color = Color(0xFF67737F),
+            )
+            Spacer(Modifier.height(6.dp))
             OutlinedTextField(
                 value = code, onValueChange = { code = it; error = null },
                 label = { Text("کد تایید ارسال‌شده به ایمیل") },
@@ -207,6 +244,18 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
                 shape = RoundedCornerShape(14.dp),
                 colors = fieldColors(accent), enabled = !busy,
             )
+            TextButton(onClick = {
+                if (resending) return@TextButton
+                resending = true
+                scope.launch {
+                    val r = app.authRepository.resendVerificationEmail()
+                    resending = false
+                    r.onSuccess { error = "ایمیل دوباره فرستاده شد — صندوق دریافتی (و پوشهٔ Spam) را چک کن" }
+                        .onFailure { error = "ارسال دوباره ناموفق بود: ${it.message?.take(120)}" }
+                }
+            }, enabled = !resending) {
+                Text(if (resending) "در حال ارسال…" else "ایمیل نرسید؟ ارسال دوباره", fontSize = 12.sp)
+            }
         }
         error?.let {
             Spacer(Modifier.height(10.dp))
@@ -235,6 +284,15 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
                         }
                         // record the account in the multi-account vault
                         val auth = app.tokenStore.loadAuth()
+                        // brand-new accounts are provisioned by the main app's
+                        // connect path; an account added straight into the
+                        // keygen never went through that step — activate its
+                        // Guardian entitlement here so the quota card works
+                        if (auth?.accessToken?.isNotBlank() == true) {
+                            runCatching {
+                                app.guardianClient.activateGuardian(KeygenApp.GUARDIAN_ENDPOINT, auth.accessToken)
+                            }
+                        }
                         val realEmail = auth?.let { fetchFxaProfileEmail(it.accessToken) }
                         val identity = realEmail
                             ?: FxaAuthRepository.normalizeEmail(email).takeIf { it.isNotBlank() }
@@ -257,7 +315,7 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
                         throw c
                     } catch (e: Exception) {
                         app.accountVault.endNewLogin()
-                        error = e.message?.take(240) ?: "ورود ناموفق بود"
+                        error = fxaLoginErrorFa(e)
                     } finally {
                         busy = false
                     }
@@ -438,6 +496,36 @@ private fun HomeScreen(
     }
 }
 
+/**
+ * One honest Persian line per failure class — including what Mozilla itself
+ * answered (status code + its own message), so a blocked/refused fresh
+ * account is never mistaken for «اینترنت نداری».
+ */
+private fun describeQuotaFailure(failure: Throwable): String {
+    val status = (failure as? com.foxy.keygen.data.GuardianHttpError)?.statusCode
+    val raw = failure.message?.take(160).orEmpty()
+    return when {
+        failure is com.foxy.keygen.data.TokenInvalidError ->
+            "نشست این اکانت را Mozilla قبول نکرد — اکانت را حذف و دوباره وارد کنید"
+        failure is com.foxy.keygen.data.QuotaExceededError ->
+            "سهمیهٔ این اکانت توسط Mozilla مسدود شده — کمی بعد دوباره"
+        status == 401 ->
+            "نشست اکانت منقضی شده (۴۰۱) — اکانت را دوباره وارد کنید"
+        status == 402 ->
+            "Mozilla برای این اکانت سهمیه‌ای ثبت نکرده (۴۰۲) — اکانت تازه‌ساخت است؛ یک‌بار در اپ اصلی وصل شوید تا فعال شود"
+        status == 403 ->
+            "Mozilla این درخواست را نپذیرفت (۴۰۳) — اکانت تازه است یا موقتاً محدود شده: $raw"
+        status == 404 ->
+            "سرویس سهمیهٔ Mozilla برای این اکانت پیدا نشد (۴۰۴): $raw"
+        status == 429 ->
+            "درخواست‌های زیاد (۴۲۹) — چند دقیقه بعد خودش دوباره تلاش می‌کند"
+        status != null ->
+            "خطای سرویس Mozilla (HTTP $status): $raw"
+        else ->
+            "اتصال به سرویس Mozilla برقرار نشد — اینترنت را بررسی کنید"
+    }
+}
+
 @Composable
 private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: String?) {
     val accent = rememberKeygenAccent()
@@ -445,7 +533,8 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
     var maxBytes by remember { mutableStateOf<Long?>(null) }
     var remaining by remember { mutableStateOf<Long?>(null) }
     var resetAt by remember { mutableStateOf<Long?>(null) }
-    var err by remember { mutableStateOf(false) }
+    // the REAL reason of the last failure — never a blanket «اتصال را بررسی کنید»
+    var errText by remember { mutableStateOf<String?>(null) }
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
     // live clock so the recharge countdown falls on its own
@@ -472,7 +561,7 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
             remaining = null
             resetAt = null
         }
-        err = false
+        errText = null
         var first = true
         while (true) {
             if (app.accountVault.activeAccount()?.email != myEmail) break
@@ -485,7 +574,7 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                         maxBytes = info.maxBytes
                         remaining = info.quotaRemaining
                         resetAt = info.quotaReset?.takeIf { it > 0L }
-                        err = false
+                        errText = null
                         // remember per-account numbers: the next switch shows
                         // them instantly, and the reset date reaches the keys
                         val previousReset = app.accountVault.quotaSnapshot(myEmail)?.resetAtEpochSeconds ?: 0L
@@ -511,12 +600,16 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                             }
                         }
                     }
-                    .onFailure {
-                        // a dead session means this account must be re-added
-                        if (app.accountVault.activeAccount()?.email == myEmail) err = true
+                    .onFailure { failure ->
+                        // a dead session means this account must be re-added;
+                        // anything else is reported WITH ITS REAL REASON so the
+                        // user sees exactly what Mozilla answered
+                        if (app.accountVault.activeAccount()?.email == myEmail) {
+                            errText = describeQuotaFailure(failure)
+                        }
                     }
             } else if (first) {
-                err = true
+                errText = "نشست فعالی برای این اکانت نیست — دوباره واردش شوید"
             }
             first = false
             delay(60_000L)
@@ -539,17 +632,15 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = when {
-                    err -> "دریافت اطلاعات ناموفق — اتصال یا نشست اکانت را بررسی کنید"
-                    // Guardian reports the quota in binary bytes (50 GiB);
-                    // decimal formatting made the card read «۵۳ گیگابایت»
-                    remaining != null && maxBytes != null -> "${formatBytesBinary(remaining!!)} از ${formatBytesBinary(maxBytes!!)} باقی مانده"
-                    remaining != null -> "${formatBytesBinary(remaining!!)} باقی مانده"
-                    else -> "…"
-                },
+                text = errText
+                    ?: when {
+                        remaining != null && maxBytes != null -> "${formatBytesBinary(remaining!!)} از ${formatBytesBinary(maxBytes!!)} باقی مانده"
+                        remaining != null -> "${formatBytesBinary(remaining!!)} باقی مانده"
+                        else -> "…"
+                    },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold,
-                color = Color(0xFF17222C),
+                color = if (errText != null) Color(0xFFB72749) else Color(0xFF17222C),
             )
             if (remaining != null && maxBytes != null && maxBytes!! > 0) {
                 Spacer(Modifier.height(8.dp))

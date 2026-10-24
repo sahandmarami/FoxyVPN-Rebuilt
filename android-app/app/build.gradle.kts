@@ -28,6 +28,13 @@ tasks.matching { it.name.startsWith("externalNativeBuild") || it.name.contains("
     .configureEach { dependsOn(fetchHevSocks5Tunnel) }
 tasks.named("preBuild").configure { dependsOn(fetchHevSocks5Tunnel) }
 
+// Play Protect verdicts ("unknown app" / "harmful app blocked") are keyed to the
+// installed package identity + APK hash. When a package name accumulates a bad
+// verdict history on Google's side, building the SAME code under a fresh
+// applicationId resets that memory. Same signing key, same functionality.
+// Enable with: gradle assembleRelease -PfoxyFreshIdentity=true
+val freshIdentity = (project.findProperty("foxyFreshIdentity") as? String) == "true"
+
 val releaseKeystoreFile = rootProject.file("release-keystore.jks")
 val releaseKeyAlias: String? = System.getenv("SIGNING_KEY_ALIAS")
 val releaseKeyPassword: String? = System.getenv("SIGNING_KEY_PASSWORD")
@@ -44,11 +51,11 @@ android {
     ndkVersion = "26.1.10909125"
 
     defaultConfig {
-        applicationId = "com.vauth.foxyvpn"
+        applicationId = if (freshIdentity) "com.foxy.vpn" else "com.vauth.foxyvpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 108
-        versionName = "3.3.0"
+        versionCode = 109
+        versionName = "3.4.0"
 
         externalNativeBuild {
             ndkBuild {

@@ -106,10 +106,19 @@ object UsageAccountant {
             }.getOrNull()
             lastRegistrySyncAtMs = System.currentTimeMillis()
             if (sync == null) {
+                // the gist itself was unreachable (or another sync is mid-flight):
+                // transient, never a verdict
                 lastRegistrySyncOk = false
                 return@launch
             }
-            lastRegistrySyncOk = true
+            lastRegistrySyncOk = sync.reported
+            if (!sync.registryReadable) {
+                // the gist was reachable and the usage WAS reported, but the
+                // registry half could not be read this round: keep enforcement
+                // decisions suspended until it is readable again
+                AppLogger.d("UsageAccountant", "registry unreadable this round; usage still reported")
+                return@launch
+            }
             when {
                 // ONLY an explicit revoked=true from a fully-read registry is a
                 // verdict. "Key not listed" is logged and ignored: a flaky raw

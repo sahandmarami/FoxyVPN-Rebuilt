@@ -217,7 +217,12 @@ class GistRegistry(context: Context) {
         Unit
     }
 
-    private fun fetchGist(id: String, token: String): Pair<JSONObject, JSONObject>? {
+    private fun fetchGist(id: String, token: String): Pair<JSONObject, JSONObject>? =
+        fetchGistDetailed(id, token).pair
+
+    data class GistRead(val pair: Pair<JSONObject, JSONObject>?, val httpCode: Int)
+
+    private fun fetchGistDetailed(id: String, token: String): GistRead {
         val request = Request.Builder()
             .url("https://api.github.com/gists/$id")
             .header("Authorization", "Bearer $token")
@@ -226,22 +231,96 @@ class GistRegistry(context: Context) {
             .get()
             .build()
         ControlPlaneHttp.client.newCall(request).execute().use { resp ->
-            if (resp.code != 200) return null
-            val body = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull() ?: return null
-            val files = body.optJSONObject("files") ?: return null
+            if (resp.code != 200) return GistRead(null, resp.code)
+            val body = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull() ?: return GistRead(null, resp.code)
+            val files = body.optJSONObject("files") ?: return GistRead(null, resp.code)
             val registry = readFile(files, "registry.json", token)?.let {
                 runCatching { JSONObject(it) }.getOrNull()
             } ?: JSONObject().put("keys", JSONArray())
             val usage = readFile(files, "usage.json", token)?.let {
                 runCatching { JSONObject(it) }.getOrNull()
             } ?: JSONObject().put("usages", JSONObject())
-            return Pair(registry, usage)
+            return GistRead(Pair(registry, usage), resp.code)
+        }
+    }
+
+    data class ConnectionCheck(
+        /** GitHub login owning the token (null when the token itself is bad). */
+        val login: String?,
+        /** Whether the stored gist was actually readable just now. */
+        val gistReadable: Boolean,
+        /** Persian, display-ready failure reason (null = everything fine). */
+        val error: String?,
+        /** True ONLY when the gist read definitively failed with 404 (gist
+         *  deleted / belongs to another account) — the only case where wiping
+         *  the stored gist id and rebuilding the registry is safe. Network
+         *  flakes and permission problems must NEVER trigger a rebuild. */
+        val gistDead: Boolean = false,
+    )
+
+    /**
+     * REAL end-to-end check of the reporting channel: token → identity → the
+     * actual gist. The old setup flow only validated /user, so a token from a
+     * different GitHub account, a token without gist permission or a deleted
+     * gist all looked «متصل ✓» — and keys minted afterwards could never
+     * report usage. This check refuses to say OK before a real gist read.
+     */
+    suspend fun checkConnection(): ConnectionCheck = withContext(Dispatchers.IO) {
+        if (githubToken.isBlank()) {
+            return@withContext ConnectionCheck(null, false, "اول توکن گیت‌هاب را وارد کنید")
+        }
+        // 1) token identity (catches expired/revoked tokens and rate limits)
+        val login = runCatching {
+            val request = Request.Builder()
+                .url("https://api.github.com/user")
+                .header("Authorization", "Bearer $githubToken")
+                .header("User-Agent", "FoxyKeygen")
+                .get()
+                .build()
+            ControlPlaneHttp.client.newCall(request).execute().use { resp ->
+                when (resp.code) {
+                    401 -> throw Exception("توکن گیت‌هاب نامعتبر است (منقضی یا باطل‌شده) — توکن جدید بسازید")
+                    403 -> throw Exception("سقف درخواست گیت‌هاب پر شده؛ چند دقیقه بعد تلاش کنید")
+                    !in 200..299 -> throw Exception("گیت‌هاب پاسخ ${resp.code} داد")
+                }
+                JSONObject(resp.body?.string().orEmpty()).optString("login").takeIf { it.isNotBlank() }
+            }
+        }.getOrElse { return@withContext ConnectionCheck(null, false, it.message ?: "اتصال به گیت‌هاب نشد") }
+        if (login == null) {
+            return@withContext ConnectionCheck(null, false, "پاسخ گیت‌هاب فاقد نام کاربری بود")
+        }
+        // 2) the gist itself (catches deleted gists and missing gist scope)
+        if (gistId.isBlank()) {
+            // nothing stored yet — token is fine, the setup flow will create the gist
+            return@withContext ConnectionCheck(login, false, null)
+        }
+        val read = runCatching { fetchGistDetailed(gistId, githubToken) }.getOrElse {
+            return@withContext ConnectionCheck(login, false, "خواندن مخزن ناموفق بود؛ اتصال اینترنت را بررسی کنید")
+        }
+        when {
+            read.pair != null -> ConnectionCheck(login, true, null)
+            read.httpCode == 404 -> ConnectionCheck(
+                login, false,
+                "مخزن گزارش پیدا نشد (حذف شده یا متعلق به حساب دیگری است) — «تست/بازسازی اتصال» را بزنید تا مخزن تازه ساخته شود",
+                gistDead = true,
+            )
+            read.httpCode == 401 -> ConnectionCheck(login, false, "توکن گیت‌هاب نامعتبر است — توکن جدید بسازید")
+            read.httpCode == 403 -> ConnectionCheck(
+                login, false,
+                "این توکن اجازهٔ خواندن Gist ندارد — موقع ساخت توکن، دسترسی gist را بدهید",
+            )
+            else -> ConnectionCheck(login, false, "گیت‌هاب پاسخ ${read.httpCode} داد")
         }
     }
 
     private fun readFile(files: JSONObject, name: String, token: String): String? {
         val file = files.optJSONObject(name) ?: return null
         return runCatching {
+            // the gist API response already carries small file contents inline —
+            // use that first; gist.githubusercontent.com (a different CDN that
+            // some networks cannot reach) is only a fallback
+            val inline = file.optString("content").orEmpty()
+            if (inline.isNotBlank() && !file.optBoolean("truncated", false)) return@runCatching inline
             val url = file.optString("raw_url")
             if (url.isNotBlank()) {
                 val req = Request.Builder().url(url)
@@ -252,7 +331,7 @@ class GistRegistry(context: Context) {
                     if (r.code == 200) r.body?.string() else null
                 }
             } else {
-                file.optString("content").takeIf { it.isNotBlank() }
+                inline.takeIf { it.isNotBlank() }
             }
         }.getOrNull()
     }

@@ -66,6 +66,7 @@ import com.vauth.foxyvpn.BuildConfig
 import com.vauth.foxyvpn.FoxyVpnApp
 import com.vauth.foxyvpn.data.FaFormat
 import com.vauth.foxyvpn.data.QuotaKeyPayload
+import com.vauth.foxyvpn.data.GistReporter
 import com.vauth.foxyvpn.data.UsageAccountant
 import com.vauth.foxyvpn.data.formatBytes
 import com.vauth.foxyvpn.data.model.ConnectionState
@@ -513,29 +514,40 @@ private fun AccountCard(
             }
 
             // registry heartbeat: makes the revocation/usage channel visible
-            // instead of silently failing somewhere in the background
+            // instead of silently failing somewhere in the background. The
+            // label carries the REAL failure class (token / gist / rate limit
+            // / network) so a broken channel is never disguised as «اینترنت».
             if (UsageAccountant.reporterContext() != null) {
-                var syncOk by remember { mutableStateOf<Boolean?>(null) }
+                var heartbeat by remember { mutableStateOf<Pair<String?, String?>?>(null) }
                 LaunchedEffect(Unit) {
                     while (true) {
-                        syncOk = if (UsageAccountant.lastRegistrySyncAtMs == 0L) null
-                        else UsageAccountant.lastRegistrySyncOk
+                        heartbeat = if (GistReporter.lastSyncAttemptAtMs == 0L) {
+                            null
+                        } else {
+                            GistReporter.lastSyncOkAtMs to GistReporter.lastSyncIssueLabel
+                        }
                         delay(5_000L)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
+                val okAt = heartbeat?.first
+                val issueLabel = heartbeat?.second
+                val heartbeatText = when {
+                    heartbeat == null -> "بررسی وضعیت کلید: در انتظار اولین همگام‌سازی…"
+                    okAt != null && issueLabel.isNullOrBlank() ->
+                        "گزارش مصرف: فعال ✓ (ارسال زنده به کلیدساز)"
+                    issueLabel != null && issueLabel.isNotBlank() ->
+                        "گزارش مصرف قطع است — $issueLabel"
+                    else -> "بررسی وضعیت کلید: در انتظار همگام‌سازی…"
+                }
                 Text(
-                    when (syncOk) {
-                        null -> "بررسی وضعیت کلید: در انتظار اولین همگام‌سازی…"
-                        true -> "بررسی وضعیت کلید: متصل ✓ (باطل‌سازی تا نیم دقیقه اعمال می‌شود)"
-                        false -> "بررسی وضعیت کلید: ناموفق — اتصال اینترنت را بررسی کنید"
-                    },
+                    heartbeatText,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = when (syncOk) {
-                        true -> Color(0xFF128A56)
-                        false -> Color(0xFFB57A00)
-                        else -> Color(0xFF97A1AC)
+                    color = when {
+                        heartbeat == null -> Color(0xFF97A1AC)
+                        okAt != null && issueLabel.isNullOrBlank() -> Color(0xFF128A56)
+                        else -> Color(0xFFB57A00)
                     },
                 )
             }

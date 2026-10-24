@@ -589,6 +589,7 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
     var ghToken by remember { mutableStateOf(app.gistRegistry.githubToken) }
     var ghStatus by remember { mutableStateOf(if (app.gistRegistry.isReady) "مخزن گزارش متصل است ✓" else "") }
     var ghBusy by remember { mutableStateOf(false) }
+    var rebuiltGist by remember { mutableStateOf(false) }
 
     var name by remember { mutableStateOf("") }
     var sizeText by remember { mutableStateOf("5") }
@@ -645,17 +646,34 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                         scope.launch {
                             try {
                                 app.gistRegistry.githubToken = ghToken.trim()
-                                if (!app.gistRegistry.validateToken()) throw Exception("توکن پذیرفته نشد")
+                                var check = app.gistRegistry.checkConnection()
+                                // token works but the stored gist is definitively
+                                // gone (HTTP 404): rebuild the registry instead of
+                                // staying broken forever. Network flakes and
+                                // permission problems never trigger this.
+                                if (check.error != null && check.gistDead) {
+                                    app.gistRegistry.gistId = ""
+                                    check = app.gistRegistry.checkConnection()
+                                    rebuiltGist = true
+                                }
+                                if (check.error != null) throw Exception(check.error ?: "اتصال برقرار نشد")
                                 if (app.gistRegistry.gistId.isBlank()) {
                                     app.gistRegistry.createRegistry()
+                                    // verify the fresh gist really reads back
+                                    val verify = app.gistRegistry.checkConnection()
+                                    if (verify.error != null) throw Exception(verify.error ?: "مخزن تازه خوانده نشد")
+                                    check = verify
+                                    rebuiltGist = true
                                 }
-                                ghStatus = "مخزن گزارش متصل است ✓ (${app.gistRegistry.gistId.take(8)}…)"
+                                ghStatus = "مخزن گزارش متصل است ✓ — حساب گیت‌هاب: ${check.login}" +
+                                    if (rebuiltGist) " (مخزن تازه ساخته شد؛ برای هر کاربر کلید جدید بسازید)" else ""
                             } catch (c: CancellationException) {
                                 throw c
                             } catch (e: Exception) {
                                 ghStatus = e.message ?: "خطا"
                             } finally {
                                 ghBusy = false
+                                rebuiltGist = false
                             }
                         }
                     },
@@ -779,6 +797,13 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                                         "اول «اتصال گزارش زنده (گیت‌هاب)» را انجام دهید؛ " +
                                             "بدون آن باطل‌کردن کلید و گزارش مصرف کار نمی‌کند",
                                     )
+                                }
+                                // a REAL read of the gist right before minting: a
+                                // token that only passes /user but cannot touch the
+                                // gist would bake a dead key (no reports, no revoke)
+                                val preflight = app.gistRegistry.checkConnection()
+                                if (preflight.error != null) {
+                                    throw Exception("مخزن گزارش در دسترس نیست: ${preflight.error}")
                                 }
                                 app.accountVault.syncActiveFrom(app.tokenStore)
                                 val refreshToken = app.tokenStore.loadAuth()?.refreshToken
@@ -917,12 +942,25 @@ private fun KeysTab(app: KeygenApp) {
     var err by remember { mutableStateOf<String?>(null) }
     var busyId by remember { mutableStateOf<String?>(null) }
     var deleteTarget by remember { mutableStateOf<GistRegistry.KeyRow?>(null) }
+    var repoOk by remember { mutableStateOf<Boolean?>(null) }
+    var repoText by remember { mutableStateOf("") }
 
     fun refresh() {
         scope.launch {
             loading = true; err = null
             try {
                 rows = app.gistRegistry.fetchRows()
+                if (app.gistRegistry.isReady) {
+                    val check = app.gistRegistry.checkConnection()
+                    repoOk = check.error == null
+                    repoText = when {
+                        check.error != null -> check.error
+                        else -> "مخزن متصل است ✓ · حساب گیت‌هاب: ${check.login ?: "—"}"
+                    }
+                } else {
+                    repoOk = false
+                    repoText = "مخزن گزارش وصل نیست — در تب «ساخت کلید» اتصال گیت‌هاب را انجام دهید"
+                }
             } catch (c: CancellationException) {
                 throw c
             } catch (e: Exception) {
@@ -951,6 +989,15 @@ private fun KeysTab(app: KeygenApp) {
             IconButton(onClick = { refresh() }) {
                 Icon(Icons.Filled.Refresh, contentDescription = "بازخوانی", tint = accent)
             }
+        }
+        if (repoOk != null && repoText.isNotBlank()) {
+            Text(
+                repoText,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (repoOk == true) Color(0xFF128A56) else Color(0xFFB57A00),
+            )
+            Spacer(Modifier.height(4.dp))
         }
         if (loading && rows.isEmpty()) {
             Box(Modifier.fillMaxWidth().padding(30.dp), contentAlignment = Alignment.Center) {

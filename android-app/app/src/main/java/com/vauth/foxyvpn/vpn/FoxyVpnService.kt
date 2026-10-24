@@ -1240,7 +1240,16 @@ class FoxyVpnService : VpnService() {
                             }.onFailure {
                                 AppLogger.d(TAG, "gist sync failed this tick: ${it.message}")
                             }.getOrNull()
-                            UsageAccountant.noteRegistrySync(sync != null)
+                            // heartbeat: green only when the usage write landed
+                            UsageAccountant.noteRegistrySync(sync?.reported == true)
+                            if (sync == null) {
+                                AppLogger.d(TAG, "gist sync returned no result this tick (offline/overlapping); will retry")
+                            }
+                            if (sync != null && !sync.registryReadable) {
+                                // gist reachable, usage reported, registry half
+                                // unreadable: no revocation verdicts this round
+                                AppLogger.d(TAG, "gist registry unreadable this round; usage still reported")
+                            }
                             if (sync != null && sync.resetAtEpochSeconds > 0L) {
                                 UsageAccountant.noteQuotaReset(sync.resetAtEpochSeconds)
                             }
@@ -1251,7 +1260,7 @@ class FoxyVpnService : VpnService() {
                                 UsageAccountant.markRevoked()
                                 continue
                             }
-                            if (sync != null && !sync.present) {
+                            if (sync != null && sync.registryReadable && !sync.present) {
                                 // registry answered but does not list the key:
                                 // not a verdict (could be a recreated registry);
                                 // the session stays up, reporting continues

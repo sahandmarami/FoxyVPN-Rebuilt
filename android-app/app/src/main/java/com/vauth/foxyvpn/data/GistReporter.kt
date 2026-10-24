@@ -23,10 +23,37 @@ import java.util.concurrent.atomic.AtomicBoolean
  * The app refreshes its own entry only, so the distributor's FoxyKeygen can
  * show every key's consumption live. Reporting failures are logged and
  * retried on the next sync tick; enforcement stays fully local.
+ *
+ * دو اصل سخت این نسخه:
+ *  ۱) گزارش مصرف هرگز به خواندن registry.json گره نخورده است — حتی وقتی
+ *     registry ناخواناست، مصرف همچنان نوشته می‌شود (قبلاً همین گره، دلیل
+ *     «بدون گزارش» ماندن کلیدساز بود).
+ *  ۲) هر شکست دسته‌بندی می‌شود (توکن/مجوز/مخزن/شبکه/سقف درخواست) تا رابط
+ *     کاربری دلیل واقعی را نشان دهد، نه همیشه «اینترنت را بررسی کنید».
  */
 object GistReporter {
 
     private const val TAG = "GistReporter"
+
+    /** Why a gist round trip failed. */
+    enum class SyncIssue {
+        NONE,          // everything worked
+        NETWORK,       // unreachable on both routes (offline / blocked route)
+        AUTH,          // HTTP 401 — the embedded token is invalid/expired/revoked
+        FORBIDDEN,     // HTTP 403 — token lacks gist permission for this gist
+        RATE_LIMITED,  // HTTP 403 with exhausted rate limit (or 429)
+        NOT_FOUND,     // HTTP 404 — the gist does not exist (deleted/recreated)
+    }
+
+    /** Persian, user-facing one-liner for the last issue (empty when NONE). */
+    fun issueLabel(issue: SyncIssue): String = when (issue) {
+        SyncIssue.NONE -> ""
+        SyncIssue.NETWORK -> "شبکه در دسترس نیست؛ با اتصال VPN دوباره تلاش می‌شود"
+        SyncIssue.AUTH -> "توکن مخزن نامعتبر است — کلید جدید از کلیدساز بگیرید"
+        SyncIssue.FORBIDDEN -> "توکن دسترسی Gist ندارد — در کلیدساز مخزن را دوباره وصل کنید"
+        SyncIssue.RATE_LIMITED -> "سقف درخواست گیت‌هاب پر شده؛ کمی بعد تلاش می‌شود"
+        SyncIssue.NOT_FOUND -> "مخزن گزارش پیدا نشد — کلید جدید از کلیدساز بگیرید"
+    }
 
     /**
      * Local SOCKS5 port of the running tunnel, or 0 when the VPN is down.
@@ -40,8 +67,33 @@ object GistReporter {
     @Volatile
     var tunnelSocksPort: Int = 0
 
+    // ---- channel health, consumed by the home-screen heartbeat ----------
+    /** When a sync round last fully succeeded (usage written), unix ms. 0 = never. */
+    @Volatile var lastSyncOkAtMs: Long = 0L
+        private set
+    /** Persian label of the last failure ("" when the last round was fine). */
+    @Volatile var lastSyncIssueLabel: String = ""
+        private set
+    /** When the last round ended (success OR failure), unix ms. */
+    @Volatile var lastSyncAttemptAtMs: Long = 0L
+        private set
+
+    private fun noteSuccess() {
+        lastSyncOkAtMs = System.currentTimeMillis()
+        lastSyncIssueLabel = ""
+        lastSyncAttemptAtMs = lastSyncOkAtMs
+    }
+
+    private fun noteFailure(issue: SyncIssue) {
+        lastSyncAttemptAtMs = System.currentTimeMillis()
+        if (issue != SyncIssue.NONE) lastSyncIssueLabel = issueLabel(issue)
+    }
+
     private var tunnelClient: OkHttpClient? = null
     private var tunnelClientPort: Int = 0
+
+    /** Route that worked last time; keeps flapping between the two to a minimum. */
+    @Volatile private var preferTunnel: Boolean = true
 
     private fun clientThroughTunnel(): OkHttpClient? {
         val port = tunnelSocksPort
@@ -50,9 +102,9 @@ object GistReporter {
         if (existing != null && tunnelClientPort == port) return existing
         val built = ControlPlaneHttp.client.newBuilder()
             .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port)))
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
-            .callTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
             .build()
         tunnelClient = built
         tunnelClientPort = port
@@ -60,25 +112,38 @@ object GistReporter {
     }
 
     /**
-     * Executes a gist request: through the tunnel when one is up, otherwise
-     * (or when that route fails) directly. Returns null only when both routes
-     * failed — the caller treats that as "offline" and retries later.
+     * Executes a gist request over the remembered-good route first and falls
+     * back to the other one. Returns null only when BOTH routes failed to
+     * even produce a response (true network-level failure).
      */
     private fun execute(request: Request): Response? {
-        val viaTunnel = clientThroughTunnel()
-        if (viaTunnel != null) {
+        val tunnel = clientThroughTunnel()
+        val firstClient: OkHttpClient
+        val secondClient: OkHttpClient?
+        if (preferTunnel && tunnel != null) {
+            firstClient = tunnel
+            secondClient = ControlPlaneHttp.client
+        } else {
+            firstClient = ControlPlaneHttp.client
+            secondClient = tunnel // null when the VPN is down
+        }
+        try {
+            val resp = firstClient.newCall(request).execute()
+            preferTunnel = tunnel != null && firstClient === tunnel
+            return resp
+        } catch (e: Exception) {
+            AppLogger.d(TAG, "gist request on the primary route failed: ${e.message}")
+        }
+        if (secondClient != null) {
             try {
-                return viaTunnel.newCall(request).execute()
+                val resp = secondClient.newCall(request).execute()
+                preferTunnel = true
+                return resp
             } catch (e: Exception) {
-                AppLogger.d(TAG, "gist request via tunnel failed, falling back to direct: ${e.message}")
+                AppLogger.d(TAG, "gist request on the fallback route failed: ${e.message}")
             }
         }
-        return try {
-            ControlPlaneHttp.client.newCall(request).execute()
-        } catch (e: Exception) {
-            AppLogger.d(TAG, "gist request failed on both routes: ${e.message}")
-            null
-        }
+        return null
     }
 
     data class RegistryEntry(
@@ -109,6 +174,9 @@ object GistReporter {
         val revoked: Boolean,
         /** True when the registry answered and contained this key. */
         val present: Boolean,
+        /** False when the registry could not be read this round (unmanaged). */
+        val registryReadable: Boolean,
+        /** True when the usage entry was actually written to the gist. */
         val reported: Boolean,
         /** Usage another device (or an earlier session) last reported — for resuming. */
         val reportedUsedBytes: Long = 0L,
@@ -116,23 +184,30 @@ object GistReporter {
         val reportedUpdatedAt: Long = 0L,
         /** Monthly quota-reset timestamp the distributor's keygen attached to this key. */
         val resetAtEpochSeconds: Long = 0L,
+        /** Precise failure class when something did not work. */
+        val issue: SyncIssue = SyncIssue.NONE,
     )
 
     /**
      * What one gist read produced. [registry] is null when registry.json could
      * NOT actually be read (raw fetch failed, body truncated, JSON broken).
-     * Distinguishing "read and empty" from "could not read" is what keeps a
-     * flaky network from being mistaken for a revocation.
+     * Distinguishing "read and empty" from "could not read" keeps a flaky
+     * network from being mistaken for a revocation — and since the usage
+     * patch below no longer depends on the registry, an unreadable registry
+     * only suspends revocation checks, never usage reporting.
      */
     private data class GistSnapshot(
         val registry: JSONObject?,
         val usage: JSONObject,
     )
 
+    private class GistFetch(val snapshot: GistSnapshot?, val issue: SyncIssue, val detail: String)
+
     /**
      * One round trip that serves both directions of the dashboard:
      * reads the registry (revocation flag) and writes this device's usage.
-     * Returns null when the gist could not be reached (caller retries later).
+     * Returns null ONLY when the gist itself was unreachable (offline) —
+     * every other outcome is a classified [SyncResult].
      */
     suspend fun sync(
         ctx: ReportContext,
@@ -142,18 +217,20 @@ object GistReporter {
     ): SyncResult? = withContext(Dispatchers.IO) {
         if (!inFlight.compareAndSet(false, true)) return@withContext null
         try {
-            val gist = fetchGist(ctx.gistId, ctx.token)
-            if (gist == null || gist.registry == null) {
-                // gist unreachable OR registry.json unreadable: a transient
-                // failure, never a verdict. Callers keep the session running
-                // and retry on the next tick.
-                AppLogger.d(TAG, "gist sync: registry not readable this tick (will retry)")
+            val fetch = fetchGist(ctx.gistId, ctx.token)
+            val gist = fetch.snapshot
+            if (gist == null) {
+                // the gist was not even read: offline / token / deleted gist
+                AppLogger.d(TAG, "gist sync failed: ${fetch.issue} (${fetch.detail})")
+                noteFailure(fetch.issue)
                 return@withContext null
             }
             var revoked = false
             var present = false
             var resetAt = 0L
-            gist.registry.optJSONArray("keys")?.let { keys ->
+            var registryReadable = false
+            gist.registry?.optJSONArray("keys")?.let { keys ->
+                registryReadable = true
                 for (i in 0 until keys.length()) {
                     val entry = keys.optJSONObject(i) ?: continue
                     if (entry.optString("id") == ctx.keyId) {
@@ -170,16 +247,32 @@ object GistReporter {
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
-            val reported = patchUsage(gist.usage, ctx, usedBytes, status) >= 0
-            if (!reported) AppLogger.d(TAG, "gist sync: usage patch failed (will retry)")
+            val patchCode = patchUsage(gist.usage, ctx, usedBytes, status)
+            val reported = patchCode in 200..299
+            val issue = when {
+                reported -> SyncIssue.NONE
+                else -> classifyHttp(patchCode)
+            }
+            if (reported) {
+                AppLogger.d(
+                    TAG,
+                    "gist sync ok: usage=${usedBytes}B, registryRead=${registryReadable}, revoked=$revoked",
+                )
+                noteSuccess()
+            } else {
+                AppLogger.d(TAG, "gist sync: usage patch failed HTTP=$patchCode")
+                noteFailure(issue)
+            }
             val usageEntry = gist.usage.optJSONObject("usages")?.optJSONObject(ctx.keyId)
             SyncResult(
                 revoked = revoked,
                 present = present,
+                registryReadable = registryReadable,
                 reported = reported,
                 reportedUsedBytes = usageEntry?.optLong("used", 0L) ?: 0L,
                 reportedUpdatedAt = usageEntry?.optLong("updated", 0L) ?: 0L,
                 resetAtEpochSeconds = resetAt,
+                issue = issue,
             )
         } finally {
             inFlight.set(false)
@@ -191,13 +284,12 @@ object GistReporter {
      * explicitly carries revoked=true for this key. Every other outcome —
      * gist unreachable, registry.json unreadable, key not listed, parse
      * hiccups — is false. A partial read or a recreated gist must never
-     * brick a valid key; that false positive is exactly what locked users
-     * out with «این کلید غیرفعال شده است».
+     * brick a valid key.
      */
     suspend fun isRevoked(ctx: ReportContext): Boolean = withContext(Dispatchers.IO) {
         runCatching {
-            val snapshot = fetchGist(ctx.gistId, ctx.token) ?: return@runCatching false
-            val registry = snapshot.registry ?: return@runCatching false
+            val fetch = fetchGist(ctx.gistId, ctx.token)
+            val registry = fetch.snapshot?.registry ?: return@runCatching false
             val keys = registry.optJSONArray("keys") ?: return@runCatching false
             for (i in 0 until keys.length()) {
                 val entry = keys.optJSONObject(i) ?: continue
@@ -223,8 +315,9 @@ object GistReporter {
      */
     suspend fun fetchReportedUsage(ctx: ReportContext): Long? = withContext(Dispatchers.IO) {
         runCatching {
-            val gist = fetchGist(ctx.gistId, ctx.token) ?: return@runCatching null
-            gist.usage.optJSONObject("usages")?.optJSONObject(ctx.keyId)
+            val fetch = fetchGist(ctx.gistId, ctx.token)
+            fetch.snapshot?.usage
+                ?.optJSONObject("usages")?.optJSONObject(ctx.keyId)
                 ?.optLong("used", 0L)
                 ?.takeIf { it > 0L }
         }.getOrNull()
@@ -244,13 +337,19 @@ object GistReporter {
     ): Boolean = withContext(Dispatchers.IO) {
         if (!inFlight.compareAndSet(false, true)) return@withContext false
         try {
-            val gist = fetchGist(ctx.gistId, ctx.token) ?: return@withContext false
+            val fetch = fetchGist(ctx.gistId, ctx.token)
+            val gist = fetch.snapshot ?: run {
+                noteFailure(fetch.issue)
+                return@withContext false
+            }
             val status = statusOverride ?: when {
                 expired -> "expired"
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
-            patchUsage(gist.usage, ctx, usedBytes, status) >= 0
+            val code = patchUsage(gist.usage, ctx, usedBytes, status)
+            if (code in 200..299) noteSuccess() else noteFailure(classifyHttp(code))
+            code in 200..299
         } finally {
             inFlight.set(false)
         }
@@ -267,7 +366,8 @@ object GistReporter {
         withContext(Dispatchers.IO) {
             if (!inFlight.compareAndSet(false, true)) return@withContext false
             try {
-                val gist = fetchGist(ctx.gistId, ctx.token) ?: return@withContext false
+                val fetch = fetchGist(ctx.gistId, ctx.token)
+                val gist = fetch.snapshot ?: return@withContext false
                 val usage = gist.usage
                 val usages = usage.optJSONObject("usages") ?: JSONObject().also { usage.put("usages", it) }
                 usages.put(
@@ -278,7 +378,7 @@ object GistReporter {
                         .put("updated", System.currentTimeMillis() / 1000L)
                         .put("periodStart", periodStartEpochSeconds),
                 )
-                patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString())
+                patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString()) in 200..299
             } finally {
                 inFlight.set(false)
             }
@@ -287,8 +387,8 @@ object GistReporter {
     /** Writes [usedBytes] into the usage map of [usageDoc] and patches the gist.
      *  Monotonic: a client never LOWERS the stored usage — a friend who just
      *  reinstalled (counter at 0) must not wipe the dashboard's real number.
-     *  The pre-write value is returned so callers can restore their counter. */
-    private fun patchUsage(usageDoc: JSONObject, ctx: ReportContext, usedBytes: Long, status: String): Long {
+     *  Returns the HTTP status of the patch (2xx = success, -1 = network). */
+    private fun patchUsage(usageDoc: JSONObject, ctx: ReportContext, usedBytes: Long, status: String): Int {
         val usage = usageDoc
         val usages = usage.optJSONObject("usages") ?: JSONObject().also { usage.put("usages", it) }
         val previous = usages.optJSONObject(ctx.keyId)
@@ -300,11 +400,18 @@ object GistReporter {
                 .put("status", status)
                 .put("updated", System.currentTimeMillis() / 1000L),
         )
-        val ok = patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString())
-        return if (ok) previousUsed else -1L
+        return patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString())
     }
 
-    private fun fetchGist(gistId: String, ghToken: String): GistSnapshot? {
+    private fun classifyHttp(code: Int): SyncIssue = when {
+        code == 401 -> SyncIssue.AUTH
+        code == 404 -> SyncIssue.NOT_FOUND
+        code == 429 -> SyncIssue.RATE_LIMITED
+        code == 403 -> SyncIssue.FORBIDDEN
+        else -> SyncIssue.NETWORK
+    }
+
+    private fun fetchGist(gistId: String, ghToken: String): GistFetch {
         val request = Request.Builder()
             .url("https://api.github.com/gists/$gistId")
             .header("Authorization", "Bearer $ghToken")
@@ -312,27 +419,43 @@ object GistReporter {
             .header("User-Agent", "FoxyVPN-Key")
             .get()
             .build()
-        execute(request)?.use { resp ->
-            if (resp.code != 200) return null
-            val body = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull() ?: return null
-            val files = body.optJSONObject("files") ?: return null
+        val resp = execute(request) ?: return GistFetch(null, SyncIssue.NETWORK, "no response on either route")
+        resp.use {
+            if (it.code != 200) {
+                return GistFetch(null, classifyHttp(it.code), "HTTP ${it.code} on gist read")
+            }
+            val body = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
+                ?: return GistFetch(null, SyncIssue.NETWORK, "gist response was not JSON")
+            val files = body.optJSONObject("files")
+                ?: return GistFetch(null, SyncIssue.NETWORK, "gist response had no files")
             // registry == null means "could not actually read registry.json"
             // — a broken/unreachable raw fetch, NOT an empty registry.
             val registry = fileContent(files, "registry.json", ghToken)
                 ?.let { runCatching { JSONObject(it) }.getOrNull() }
             val usage = fileContent(files, "usage.json", ghToken)?.let { runCatching { JSONObject(it) }.getOrNull() }
-            return GistSnapshot(
-                registry = registry,
-                usage = usage ?: JSONObject().put("usages", JSONObject()),
+            return GistFetch(
+                GistSnapshot(
+                    registry = registry,
+                    usage = usage ?: JSONObject().put("usages", JSONObject()),
+                ),
+                SyncIssue.NONE,
+                "ok",
             )
         }
-        return null
     }
 
+    /**
+     * Reads a gist file. The gist API response ALREADY carries the file
+     * content inline for small files, so the inline content is used FIRST —
+     * the extra raw_url request (gist.githubusercontent.com, a different CDN
+     * that is frequently unreachable from some networks) is only a fallback.
+     */
     private fun fileContent(files: JSONObject, name: String, ghToken: String): String? {
         val file = files.optJSONObject(name) ?: return null
         if (file.optString("type") != "file") return null
         return runCatching {
+            val inline = file.optString("content").orEmpty()
+            if (inline.isNotBlank() && !file.optBoolean("truncated", false)) return@runCatching inline
             val url = file.optString("raw_url")
             if (url.isNotBlank()) {
                 val req = Request.Builder().url(url)
@@ -341,12 +464,13 @@ object GistReporter {
                     if (r.code == 200) r.body?.string() else null
                 }
             } else {
-                file.optString("content").takeIf { it.isNotBlank() }
+                inline.takeIf { it.isNotBlank() }
             }
         }.getOrNull()
     }
 
-    private fun patchGist(gistId: String, ghToken: String, fileName: String, content: String): Boolean {
+    /** PATCHes one file of the gist. Returns the HTTP status (2xx = ok, -1 = network). */
+    private fun patchGist(gistId: String, ghToken: String, fileName: String, content: String): Int {
         val payload = JSONObject().put(
             "files",
             JSONObject().put(fileName, JSONObject().put("content", content)),
@@ -359,8 +483,8 @@ object GistReporter {
             .patch(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
         execute(request)?.use { resp ->
-            return resp.code in 200..299
+            return resp.code
         }
-        return false
+        return -1
     }
 }

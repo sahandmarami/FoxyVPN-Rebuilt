@@ -105,14 +105,28 @@ object GistReporter {
 
     /** Result of a combined revocation-check + usage-report round trip. */
     data class SyncResult(
+        /** True ONLY when a fully-read registry explicitly flags this key revoked. */
         val revoked: Boolean,
         /** True when the registry answered and contained this key. */
         val present: Boolean,
         val reported: Boolean,
         /** Usage another device (or an earlier session) last reported — for resuming. */
         val reportedUsedBytes: Long = 0L,
+        /** "updated" timestamp of the usage entry that was read (unix seconds). */
+        val reportedUpdatedAt: Long = 0L,
         /** Monthly quota-reset timestamp the distributor's keygen attached to this key. */
         val resetAtEpochSeconds: Long = 0L,
+    )
+
+    /**
+     * What one gist read produced. [registry] is null when registry.json could
+     * NOT actually be read (raw fetch failed, body truncated, JSON broken).
+     * Distinguishing "read and empty" from "could not read" is what keeps a
+     * flaky network from being mistaken for a revocation.
+     */
+    private data class GistSnapshot(
+        val registry: JSONObject?,
+        val usage: JSONObject,
     )
 
     /**
@@ -129,14 +143,17 @@ object GistReporter {
         if (!inFlight.compareAndSet(false, true)) return@withContext null
         try {
             val gist = fetchGist(ctx.gistId, ctx.token)
-            if (gist == null) {
-                AppLogger.d(TAG, "gist sync: fetch failed (will retry on the next tick)")
+            if (gist == null || gist.registry == null) {
+                // gist unreachable OR registry.json unreadable: a transient
+                // failure, never a verdict. Callers keep the session running
+                // and retry on the next tick.
+                AppLogger.d(TAG, "gist sync: registry not readable this tick (will retry)")
                 return@withContext null
             }
             var revoked = false
             var present = false
             var resetAt = 0L
-            gist.first.optJSONArray("keys")?.let { keys ->
+            gist.registry.optJSONArray("keys")?.let { keys ->
                 for (i in 0 until keys.length()) {
                     val entry = keys.optJSONObject(i) ?: continue
                     if (entry.optString("id") == ctx.keyId) {
@@ -153,15 +170,15 @@ object GistReporter {
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
-            val reported = patchUsage(gist.second, ctx, usedBytes, status) >= 0
+            val reported = patchUsage(gist.usage, ctx, usedBytes, status) >= 0
             if (!reported) AppLogger.d(TAG, "gist sync: usage patch failed (will retry)")
-            val reportedUsed = gist.second.optJSONObject("usages")
-                ?.optJSONObject(ctx.keyId)?.optLong("used", 0L) ?: 0L
+            val usageEntry = gist.usage.optJSONObject("usages")?.optJSONObject(ctx.keyId)
             SyncResult(
                 revoked = revoked,
                 present = present,
                 reported = reported,
-                reportedUsedBytes = reportedUsed,
+                reportedUsedBytes = usageEntry?.optLong("used", 0L) ?: 0L,
+                reportedUpdatedAt = usageEntry?.optLong("updated", 0L) ?: 0L,
                 resetAtEpochSeconds = resetAt,
             )
         } finally {
@@ -170,22 +187,30 @@ object GistReporter {
     }
 
     /**
-     * True when the registry (reachable!) marks this key revoked or no longer
-     * lists it at all — the distributor deleted it. False when the gist could
-     * not be reached: being offline must not brick the key.
+     * Strict revocation verdict: true ONLY when a fully-read registry
+     * explicitly carries revoked=true for this key. Every other outcome —
+     * gist unreachable, registry.json unreadable, key not listed, parse
+     * hiccups — is false. A partial read or a recreated gist must never
+     * brick a valid key; that false positive is exactly what locked users
+     * out with «این کلید غیرفعال شده است».
      */
     suspend fun isRevoked(ctx: ReportContext): Boolean = withContext(Dispatchers.IO) {
         runCatching {
-            val pair = fetchGist(ctx.gistId, ctx.token) ?: return@runCatching false
-            val keys = pair.first.optJSONArray("keys") ?: return@runCatching false
+            val snapshot = fetchGist(ctx.gistId, ctx.token) ?: return@runCatching false
+            val registry = snapshot.registry ?: return@runCatching false
+            val keys = registry.optJSONArray("keys") ?: return@runCatching false
             for (i in 0 until keys.length()) {
                 val entry = keys.optJSONObject(i) ?: continue
                 if (entry.optString("id") == ctx.keyId) {
                     return@runCatching entry.optBoolean("revoked", false)
                 }
             }
-            // the registry answered but does not know this key: it was deleted
-            true
+            // the registry answered but does not list this key. That can mean
+            // a deleted key — or a recreated/partial registry. Deletion has
+            // its own explicit path (باطل‌کردن کلید), so absence is NOT
+            // treated as revocation; the session simply stays unmanaged.
+            AppLogger.d(TAG, "registry does not list this key; not treating absence as revocation")
+            false
         }.getOrElse {
             AppLogger.d(TAG, "revocation check failed (treating as not revoked): ${it.message}")
             false
@@ -199,7 +224,7 @@ object GistReporter {
     suspend fun fetchReportedUsage(ctx: ReportContext): Long? = withContext(Dispatchers.IO) {
         runCatching {
             val gist = fetchGist(ctx.gistId, ctx.token) ?: return@runCatching null
-            gist.second.optJSONObject("usages")?.optJSONObject(ctx.keyId)
+            gist.usage.optJSONObject("usages")?.optJSONObject(ctx.keyId)
                 ?.optLong("used", 0L)
                 ?.takeIf { it > 0L }
         }.getOrNull()
@@ -225,11 +250,39 @@ object GistReporter {
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
-            patchUsage(gist.second, ctx, usedBytes, status) >= 0
+            patchUsage(gist.usage, ctx, usedBytes, status) >= 0
         } finally {
             inFlight.set(false)
         }
     }
+
+    /**
+     * The monthly volume was re-granted: authoritatively zero this key's
+     * usage entry. Unlike the regular monotonic patch this MAY lower the
+     * stored value — the new period legitimately starts from 0 — and it
+     * stamps [periodStartEpochSeconds] so older (previous-period) numbers
+     * can be recognised and ignored when they show up again.
+     */
+    suspend fun pushPeriodReset(ctx: ReportContext, periodStartEpochSeconds: Long): Boolean =
+        withContext(Dispatchers.IO) {
+            if (!inFlight.compareAndSet(false, true)) return@withContext false
+            try {
+                val gist = fetchGist(ctx.gistId, ctx.token) ?: return@withContext false
+                val usage = gist.usage
+                val usages = usage.optJSONObject("usages") ?: JSONObject().also { usage.put("usages", it) }
+                usages.put(
+                    ctx.keyId,
+                    JSONObject()
+                        .put("used", 0L)
+                        .put("status", "active")
+                        .put("updated", System.currentTimeMillis() / 1000L)
+                        .put("periodStart", periodStartEpochSeconds),
+                )
+                patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString())
+            } finally {
+                inFlight.set(false)
+            }
+        }
 
     /** Writes [usedBytes] into the usage map of [usageDoc] and patches the gist.
      *  Monotonic: a client never LOWERS the stored usage — a friend who just
@@ -251,7 +304,7 @@ object GistReporter {
         return if (ok) previousUsed else -1L
     }
 
-    private fun fetchGist(gistId: String, ghToken: String): Pair<JSONObject, JSONObject>? {
+    private fun fetchGist(gistId: String, ghToken: String): GistSnapshot? {
         val request = Request.Builder()
             .url("https://api.github.com/gists/$gistId")
             .header("Authorization", "Bearer $ghToken")
@@ -263,9 +316,15 @@ object GistReporter {
             if (resp.code != 200) return null
             val body = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull() ?: return null
             val files = body.optJSONObject("files") ?: return null
-            val registry = fileContent(files, "registry.json", ghToken)?.let { runCatching { JSONObject(it) }.getOrNull() }
+            // registry == null means "could not actually read registry.json"
+            // — a broken/unreachable raw fetch, NOT an empty registry.
+            val registry = fileContent(files, "registry.json", ghToken)
+                ?.let { runCatching { JSONObject(it) }.getOrNull() }
             val usage = fileContent(files, "usage.json", ghToken)?.let { runCatching { JSONObject(it) }.getOrNull() }
-            return Pair(registry ?: JSONObject(), usage ?: JSONObject().put("usages", JSONObject()))
+            return GistSnapshot(
+                registry = registry,
+                usage = usage ?: JSONObject().put("usages", JSONObject()),
+            )
         }
         return null
     }

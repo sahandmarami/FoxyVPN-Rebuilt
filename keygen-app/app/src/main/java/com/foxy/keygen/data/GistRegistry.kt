@@ -32,6 +32,8 @@ class GistRegistry(context: Context) {
         val updatedAt: Long = 0L,
         /** E-mail of the Firefox account whose quota this key consumes. */
         val acct: String = "",
+        /** Next monthly volume re-grant (unix seconds) stamped by the keygen. */
+        val reset: Long = 0L,
     ) {
         /** Total plan bytes: GB entries win, otherwise MB, otherwise unlimited (0). */
         val planBytes: Long
@@ -123,6 +125,7 @@ class GistRegistry(context: Context) {
                     status = usage?.optString("status").orEmpty(),
                     updatedAt = usage?.optLong("updated") ?: 0L,
                     acct = entry.optString("acct"),
+                    reset = entry.optLong("reset", 0L),
                 ),
             )
         }

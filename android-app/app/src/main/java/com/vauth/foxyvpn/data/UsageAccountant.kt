@@ -27,6 +27,8 @@ object UsageAccountant {
     @Volatile var blockReason: BlockReason = BlockReason.NONE
         private set
     @Volatile private var reporterContext: GistReporter.ReportContext? = null
+    /** Epoch seconds of the monthly boundary the counter belongs to (0 = unknown). */
+    @Volatile private var periodStartSec: Long = 0L
 
     /** Last registry round trip: did it answer? Set by [refreshFromRegistryAsync]/service ticks. */
     @Volatile var lastRegistrySyncOk: Boolean = false
@@ -41,15 +43,25 @@ object UsageAccountant {
         val stored = activatedKeyStore.loadUsage()
         usedBytes.set(stored.usedBytes)
         lastNativeTotal.set(-1L)
+        periodStartSec = quotaKey?.keyId?.let { activatedKeyStore.periodStartEpochSeconds(it) } ?: 0L
+        maybeApplyMonthlyReset()
         recomputeBlock(activatedKeyStore.nowMillis())
     }
 
     /**
      * Raises the counter to a value seen elsewhere (the distributor's gist);
-     * used to resume a friend's usage after logout or a reinstall. Monotonic.
+     * used to resume a friend's usage after logout or a reinstall. Monotonic
+     * within one monthly period. [updatedSec] is the "updated" stamp of the
+     * value being ingested: anything reported before the current period's
+     * start belongs to the previous month and must not resurrect the old
+     * counter after a reset.
      */
-    fun ingestExternalUsed(bytes: Long) {
+    fun ingestExternalUsed(bytes: Long, updatedSec: Long = 0L) {
         if (key == null || bytes <= 0L) return
+        if (updatedSec > 0L && periodStartSec > 0L && updatedSec < periodStartSec) {
+            AppLogger.d("UsageAccountant", "ignoring previous-period usage snapshot ($updatedSec) after the monthly reset")
+            return
+        }
         val current = usedBytes.get()
         if (bytes <= current) return
         usedBytes.set(bytes)
@@ -99,17 +111,19 @@ object UsageAccountant {
             }
             lastRegistrySyncOk = true
             when {
-                sync.revoked || !sync.present -> {
-                    if (!sync.present) {
-                        AppLogger.w("UsageAccountant", "registry no longer lists this key; treating as revoked")
-                    }
+                // ONLY an explicit revoked=true from a fully-read registry is a
+                // verdict. "Key not listed" is logged and ignored: a flaky raw
+                // fetch or a recreated gist must never brick a valid key.
+                sync.revoked -> {
+                    AppLogger.w("UsageAccountant", "registry explicitly marks this key revoked")
                     markRevoked()
                 }
-                sync.present -> {
+                !sync.present -> {
+                    AppLogger.d("UsageAccountant", "registry does not list this key; session stays active (unmanaged by the registry)")
+                }
+                else -> {
                     clearRevocation()
-                    if (sync.reportedUsedBytes > usedBytes.get()) {
-                        ingestExternalUsed(sync.reportedUsedBytes)
-                    }
+                    ingestExternalUsed(sync.reportedUsedBytes, sync.reportedUpdatedAt)
                     if (sync.resetAtEpochSeconds > 0L) {
                         noteQuotaReset(sync.resetAtEpochSeconds)
                     }
@@ -133,6 +147,7 @@ object UsageAccountant {
         blockReason = BlockReason.NONE
         lastRegistrySyncOk = false
         lastRegistrySyncAtMs = 0L
+        periodStartSec = 0L
     }
 
     fun keyAttached(): Boolean = key != null
@@ -214,7 +229,43 @@ object UsageAccountant {
     /** Remembers when the account's monthly volume is re-granted. */
     fun noteQuotaReset(resetAtEpochSeconds: Long) {
         val id = key?.keyId ?: return
-        if (resetAtEpochSeconds > 0L) store?.saveQuotaReset(id, resetAtEpochSeconds)
+        if (resetAtEpochSeconds > 0L) {
+            store?.saveQuotaReset(id, resetAtEpochSeconds)
+            maybeApplyMonthlyReset()
+        }
+    }
+
+    /**
+     * Monthly recharge: once the stamped reset moment has passed, the
+     * counter starts over — locally (all three persisted copies) and in the
+     * distributor's gist — and a QUOTA block lifts automatically. The stored
+     * boundary then rolls forward by 30-day approximations until the
+     * keygen stamps the exact next date; this keeps working even if the
+     * distributor's device is offline for months.
+     */
+    fun maybeApplyMonthlyReset() {
+        val id = key?.keyId ?: return
+        val s = store ?: return
+        val resetAt = s.quotaResetEpochSeconds(id)
+        if (resetAt <= 0L) return
+        val nowSec = System.currentTimeMillis() / 1000L
+        if (nowSec < resetAt) return
+        AppLogger.i("UsageAccountant", "monthly volume re-granted: resetting the usage counter for the new period")
+        s.resetUsage(id, resetAt)
+        usedBytes.set(0L)
+        lastNativeTotal.set(-1L)
+        periodStartSec = resetAt
+        // roll the boundary forward until it lies in the future (~monthly)
+        var next = resetAt
+        while (next <= nowSec) next += 30L * 24L * 60L * 60L
+        s.saveQuotaReset(id, next)
+        val ctx = reporterContext
+        if (ctx != null) {
+            scope.launch {
+                runCatching { GistReporter.pushPeriodReset(ctx, resetAt) }
+            }
+        }
+        recomputeBlock(System.currentTimeMillis())
     }
 
     fun quotaResetAt(): Long {

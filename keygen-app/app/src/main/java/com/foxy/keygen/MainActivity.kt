@@ -85,6 +85,7 @@ import com.foxy.keygen.data.FxaAuthRepository
 import com.foxy.keygen.data.GistRegistry
 import com.foxy.keygen.data.QuotaKeyCodec
 import com.foxy.keygen.data.formatBytes
+import com.foxy.keygen.data.formatBytesBinary
 import com.foxy.keygen.ui.KeygenTheme
 import com.foxy.keygen.ui.fieldColors
 import com.foxy.keygen.ui.rememberKeygenAccent
@@ -540,8 +541,10 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
             Text(
                 text = when {
                     err -> "دریافت اطلاعات ناموفق — اتصال یا نشست اکانت را بررسی کنید"
-                    remaining != null && maxBytes != null -> "${formatBytes(remaining!!)} از ${formatBytes(maxBytes!!)} باقی مانده"
-                    remaining != null -> "${formatBytes(remaining!!)} باقی مانده"
+                    // Guardian reports the quota in binary bytes (50 GiB);
+                    // decimal formatting made the card read «۵۳ گیگابایت»
+                    remaining != null && maxBytes != null -> "${formatBytesBinary(remaining!!)} از ${formatBytesBinary(maxBytes!!)} باقی مانده"
+                    remaining != null -> "${formatBytesBinary(remaining!!)} باقی مانده"
                     else -> "…"
                 },
                 fontSize = 15.sp,
@@ -1105,16 +1108,38 @@ private fun KeyRowCard(
                 color = Color(0xFF67737F),
             )
             Spacer(Modifier.height(6.dp))
+            // Usage belongs to the CURRENT monthly period: if the client last
+            // reported before this period's reset stamp, the number shown is
+            // previous-month data and the new month starts from zero.
+            val stalePeriod = row.reset > 0 && row.updatedAt > 0 && row.updatedAt < row.reset
+            val shownUsed = if (stalePeriod) 0L else row.usedBytes
             Text(
-                "مصرف: ${formatBytes(row.usedBytes)}" + (if (row.updatedAt > 0) "  ·  آخرین گزارش: " + formatTime(row.updatedAt) else ""),
+                "مصرف این ماه: ${formatBytes(shownUsed)}" +
+                    (if (row.updatedAt > 0 && !stalePeriod) "  ·  آخرین گزارش: " + formatTime(row.updatedAt) else ""),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Color(0xFF17222C),
             )
+            if (stalePeriod) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "آمار ماه جدید با اولین اتصال کاربر به‌روز می‌شود",
+                    fontSize = 10.sp,
+                    color = Color(0xFF97A1AC),
+                )
+            }
+            if (row.reset > 0) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    FaFormat.quotaResetLabel(row.reset, nowMs),
+                    fontSize = 10.sp,
+                    color = Color(0xFF97A1AC),
+                )
+            }
             if (row.planBytes > 0) {
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
-                    progress = { (row.usedBytes.toFloat() / row.planBytes.toFloat()).coerceIn(0f, 1f) },
+                    progress = { (shownUsed.toFloat() / row.planBytes.toFloat()).coerceIn(0f, 1f) },
                     modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
                     color = if (row.revoked) Color(0xFFB72749) else accent,
                     trackColor = Color(0xFFEDF1F5),

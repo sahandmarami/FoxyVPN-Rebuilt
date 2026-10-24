@@ -338,6 +338,20 @@ class FoxyVpnService : VpnService() {
             }
             // quota-key gate: never open a tunnel when the key is exhausted,
             // expired or revoked
+            if (UsageAccountant.blockReason == UsageAccountant.BlockReason.REVOKED) {
+                // self-heal: a tombstone that the registry does not confirm
+                // right now was almost certainly a false positive from an old
+                // build (a flaky gist read was mistaken for a revocation).
+                // Fail open unless the registry explicitly says revoked.
+                val keyCtx = UsageAccountant.reporterContext()
+                val confirmed = keyCtx != null && runCatching {
+                    withTimeoutOrNull(CONNECT_GIST_CHECK_TIMEOUT_MS) { GistReporter.isRevoked(keyCtx) }
+                }.getOrNull() == true
+                if (!confirmed) {
+                    AppLogger.w(TAG, "stored revocation is not confirmed by the registry; clearing it")
+                    UsageAccountant.clearRevocation()
+                }
+            }
             if (UsageAccountant.blockReason != UsageAccountant.BlockReason.NONE) {
                 _lastError.value = keyBlockMessage(UsageAccountant.blockReason)
                 AppLogger.w(TAG, "connect blocked by quota key: ${UsageAccountant.blockReason}")
@@ -1206,6 +1220,9 @@ class FoxyVpnService : VpnService() {
             try {
                 while (isActive && _state.value != ConnectionState.DISCONNECTED) {
                     val now = System.currentTimeMillis()
+                    // the month may have rolled over mid-session: lift a QUOTA
+                    // block and zero the counter the moment volume re-grants
+                    UsageAccountant.maybeApplyMonthlyReset()
                     if (UsageAccountant.blockReason != UsageAccountant.BlockReason.NONE) {
                         _lastError.value = keyBlockMessage(UsageAccountant.blockReason)
                         AppLogger.w(TAG, "quota key reached its limit mid-session: ${UsageAccountant.blockReason}")
@@ -1232,14 +1249,18 @@ class FoxyVpnService : VpnService() {
                             if (sync != null && sync.resetAtEpochSeconds > 0L) {
                                 UsageAccountant.noteQuotaReset(sync.resetAtEpochSeconds)
                             }
-                            if (sync?.revoked == true || (sync != null && !sync.present)) {
-                                // revoked, or dropped from the registry entirely
-                                if (sync != null && !sync.present) {
-                                    AppLogger.w(TAG, "gist registry no longer lists this key; treating as revoked")
-                                }
+                            if (sync?.revoked == true) {
+                                // an EXPLICIT revoked=true from a fully-read
+                                // registry — the only thing that disconnects
                                 AppLogger.w(TAG, "gist registry marks this key revoked; disconnecting")
                                 UsageAccountant.markRevoked()
                                 continue
+                            }
+                            if (sync != null && !sync.present) {
+                                // registry answered but does not list the key:
+                                // not a verdict (could be a recreated registry);
+                                // the session stays up, reporting continues
+                                AppLogger.d(TAG, "gist registry does not list this key; keeping the session alive")
                             }
                             if (sync?.present == true && !sync.revoked) {
                                 // the distributor re-enabled the key

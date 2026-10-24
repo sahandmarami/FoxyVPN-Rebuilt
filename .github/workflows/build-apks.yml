@@ -26,7 +26,7 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - name: Build FoxyVPN (main app) v3.0.0
+      - name: Build FoxyVPN (main app) v3.1.0
         working-directory: android-app
         env:
           SIGNING_STORE_PASSWORD: foxyvpn
@@ -34,15 +34,15 @@ jobs:
           SIGNING_KEY_PASSWORD: foxyvpn
         run: gradle assembleRelease --no-daemon --stacktrace
 
-      - name: Build FoxyKeygen v2.0.0
+      - name: Build FoxyKeygen v2.1.0
         working-directory: keygen-app
         run: gradle assembleRelease --no-daemon --stacktrace
 
       - name: Collect APKs
         run: |
           mkdir -p out
-          cp android-app/app/build/outputs/apk/release/app-release.apk out/FoxyVPN-v3.0.0.apk
-          cp keygen-app/app/build/outputs/apk/release/app-release.apk out/FoxyKeygen-v2.0.0.apk
+          cp android-app/app/build/outputs/apk/release/app-release.apk out/FoxyVPN-v3.1.0.apk
+          cp keygen-app/app/build/outputs/apk/release/app-release.apk out/FoxyKeygen-v2.1.0.apk
           ls -la out
 
       - name: Upload APKs

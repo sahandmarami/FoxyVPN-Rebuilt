@@ -122,6 +122,27 @@ class ActivatedKeyStore(context: Context) {
             .apply()
     }
 
+    /**
+     * The monthly volume was re-granted: force every copy of the counter
+     * (ledger + both mirrors) back to zero. Unlike [saveUsage] this is NOT
+     * monotonic — a new period legitimately starts from 0 — and it stamps
+     * [periodStart] so any stale previous-period number that shows up later
+     * (a queued gist answer, an older device) can be recognised and dropped.
+     */
+    fun resetUsage(keyId: String, periodStartEpochSeconds: Long, nowMillis: Long = System.currentTimeMillis()) {
+        writeUsage(mainPrefs, 0L, nowMillis)
+        writeUsage(mirrorPrefs, 0L, nowMillis)
+        ledgerPrefs.edit()
+            .putLong(KEY_LEDGER_USED + keyId, 0L)
+            .putLong(KEY_LEDGER_CLOCK + keyId, nowMillis)
+            .putLong(KEY_PERIOD_START + keyId, periodStartEpochSeconds)
+            .apply()
+    }
+
+    /** Epoch seconds of the monthly boundary this counter belongs to (0 = unknown). */
+    fun periodStartEpochSeconds(keyId: String): Long =
+        ledgerPrefs.getLong(KEY_PERIOD_START + keyId, 0L)
+
     /** Raises the stored counter for the active key (gist seeding). */
     fun ingestExternalUsage(usedBytes: Long) {
         val id = keyId() ?: return
@@ -172,6 +193,7 @@ class ActivatedKeyStore(context: Context) {
         private const val KEY_LEDGER_CLOCK = "clock_"
         private const val KEY_REVOKED = "revoked_"
         private const val KEY_RESET = "reset_"
+        private const val KEY_PERIOD_START = "pstart_"
     }
 }
 

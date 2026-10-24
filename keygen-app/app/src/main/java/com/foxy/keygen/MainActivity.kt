@@ -483,16 +483,22 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                         if (app.accountVault.activeAccount()?.email != myEmail) return@onSuccess
                         maxBytes = info.maxBytes
                         remaining = info.quotaRemaining
-                        resetAt = info.quotaReset.takeIf { it > 0L }
+                        resetAt = info.quotaReset?.takeIf { it > 0L }
                         err = false
                         // remember per-account numbers: the next switch shows
                         // them instantly, and the reset date reaches the keys
                         val previousReset = app.accountVault.quotaSnapshot(myEmail)?.resetAtEpochSeconds ?: 0L
-                        app.accountVault.saveQuotaSnapshot(myEmail, info.maxBytes, info.quotaRemaining, info.quotaReset)
-                        if (info.quotaReset > 0L && info.quotaReset != previousReset) {
+                        val newReset = info.quotaReset ?: 0L
+                        app.accountVault.saveQuotaSnapshot(
+                            myEmail,
+                            info.maxBytes ?: 0L,
+                            info.quotaRemaining ?: 0L,
+                            newReset,
+                        )
+                        if (newReset > 0L && newReset != previousReset) {
                             // new monthly cycle — stamp the fresh reset date on
                             // this account's keys so clients see the new date
-                            runCatching { app.gistRegistry.updateResetsForAccount(myEmail, info.quotaReset) }
+                            runCatching { app.gistRegistry.updateResetsForAccount(myEmail, newReset) }
                         }
                         // the active row may still carry a placeholder label —
                         // resolve its real e-mail once and merge duplicates

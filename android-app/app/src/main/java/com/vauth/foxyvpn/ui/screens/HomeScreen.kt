@@ -518,7 +518,7 @@ private fun AccountCard(
             // label carries the REAL failure class (token / gist / rate limit
             // / network) so a broken channel is never disguised as «اینترنت».
             if (UsageAccountant.reporterContext() != null) {
-                var heartbeat by remember { mutableStateOf<Pair<String?, String?>?>(null) }
+                var heartbeat by remember { mutableStateOf<Pair<Long, String>?>(null) }
                 LaunchedEffect(Unit) {
                     while (true) {
                         heartbeat = if (GistReporter.lastSyncAttemptAtMs == 0L) {

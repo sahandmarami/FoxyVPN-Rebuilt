@@ -339,18 +339,13 @@ class FoxyVpnService : VpnService() {
             // quota-key gate: never open a tunnel when the key is exhausted,
             // expired or revoked
             if (UsageAccountant.blockReason == UsageAccountant.BlockReason.REVOKED) {
-                // self-heal: a tombstone that the registry does not confirm
-                // right now was almost certainly a false positive from an old
-                // build (a flaky gist read was mistaken for a revocation).
-                // Fail open unless the registry explicitly says revoked.
-                val keyCtx = UsageAccountant.reporterContext()
-                val confirmed = keyCtx != null && runCatching {
-                    withTimeoutOrNull(CONNECT_GIST_CHECK_TIMEOUT_MS) { GistReporter.isRevoked(keyCtx) }
-                }.getOrNull() == true
-                if (!confirmed) {
-                    AppLogger.w(TAG, "stored revocation is not confirmed by the registry; clearing it")
-                    UsageAccountant.clearRevocation()
-                }
+                // self-heal: tombstones written by older builds could be false
+                // positives (a flaky gist read was mistaken for a revocation).
+                // Drop the unconfirmed verdict locally; the strict registry
+                // re-check inside the connect job re-blocks a genuinely
+                // revoked key within the same attempt.
+                AppLogger.w(TAG, "clearing an unconfirmed revocation tombstone before connect")
+                UsageAccountant.clearRevocation()
             }
             if (UsageAccountant.blockReason != UsageAccountant.BlockReason.NONE) {
                 _lastError.value = keyBlockMessage(UsageAccountant.blockReason)

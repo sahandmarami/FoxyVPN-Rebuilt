@@ -1229,6 +1229,9 @@ class FoxyVpnService : VpnService() {
                                 AppLogger.d(TAG, "gist sync failed this tick: ${it.message}")
                             }.getOrNull()
                             UsageAccountant.noteRegistrySync(sync != null)
+                            if (sync != null && sync.resetAtEpochSeconds > 0L) {
+                                UsageAccountant.noteQuotaReset(sync.resetAtEpochSeconds)
+                            }
                             if (sync?.revoked == true || (sync != null && !sync.present)) {
                                 // revoked, or dropped from the registry entirely
                                 if (sync != null && !sync.present) {

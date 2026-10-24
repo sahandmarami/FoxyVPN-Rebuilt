@@ -118,6 +118,43 @@ class AccountVault(context: Context) {
         return true
     }
 
+    // ---------- per-account quota snapshots ----------
+
+    data class QuotaSnapshot(
+        val maxBytes: Long,
+        val remainingBytes: Long,
+        val resetAtEpochSeconds: Long,
+        val updatedAtEpochSeconds: Long,
+    )
+
+    /**
+     * Last quota numbers seen for [email]. The switcher shows this snapshot
+     * the instant an account becomes active — so the card visibly changes with
+     * the account — and refreshes it from Guardian in the background.
+     */
+    fun quotaSnapshot(email: String): QuotaSnapshot? {
+        val e = email.trim().lowercase()
+        val max = prefs.getLong("qs_max_$e", -1L)
+        if (max < 0L) return null
+        return QuotaSnapshot(
+            maxBytes = max,
+            remainingBytes = prefs.getLong("qs_rem_$e", 0L),
+            resetAtEpochSeconds = prefs.getLong("qs_reset_$e", 0L),
+            updatedAtEpochSeconds = prefs.getLong("qs_time_$e", 0L),
+        )
+    }
+
+    fun saveQuotaSnapshot(email: String, maxBytes: Long, remainingBytes: Long, resetAtEpochSeconds: Long) {
+        val e = email.trim().lowercase()
+        if (e.isBlank() || maxBytes <= 0L) return
+        prefs.edit()
+            .putLong("qs_max_$e", maxBytes)
+            .putLong("qs_rem_$e", remainingBytes.coerceAtLeast(0L))
+            .putLong("qs_reset_$e", resetAtEpochSeconds)
+            .putLong("qs_time_$e", System.currentTimeMillis() / 1000L)
+            .apply()
+    }
+
     fun remove(email: String) {
         val email = email.trim().lowercase()
         val rest = accounts.filterNot { it.email == email }

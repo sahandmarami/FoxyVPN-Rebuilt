@@ -77,6 +77,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.foxy.keygen.BuildConfig
 import com.foxy.keygen.data.AccountVault
 import com.foxy.keygen.data.ControlPlaneHttp
 import com.foxy.keygen.data.FaFormat
@@ -338,7 +339,11 @@ private fun HomeScreen(
             ) {
                 Icon(Icons.Filled.VpnKey, contentDescription = null, tint = accent, modifier = Modifier.size(24.dp))
                 Spacer(Modifier.width(10.dp))
-                Text("FoxyKeygen", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color(0xFF17222C))
+                Column {
+                    Text("FoxyKeygen", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color(0xFF17222C))
+                    // visible version so «کدام نسخه نصب است؟» همیشه روی صفحه جواب دارد
+                    Text("v" + BuildConfig.VERSION_NAME, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF97A1AC))
+                }
                 Spacer(Modifier.weight(1f))
                 // ---- account switcher ----
                 Box {
@@ -455,9 +460,17 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
         // loop exits instead of writing the old account's numbers over the
         // new account's card
         val myEmail = activeEmail
-        maxBytes = null
-        remaining = null
-        resetAt = null
+        // 1) show this account's last-known numbers IMMEDIATELY so switching
+        //    visibly swaps the card before the network answers
+        app.accountVault.quotaSnapshot(myEmail)?.let { snap ->
+            maxBytes = snap.maxBytes
+            remaining = snap.remainingBytes
+            resetAt = snap.resetAtEpochSeconds.takeIf { it > 0L }
+        } ?: run {
+            maxBytes = null
+            remaining = null
+            resetAt = null
+        }
         err = false
         var first = true
         while (true) {
@@ -470,8 +483,17 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                         if (app.accountVault.activeAccount()?.email != myEmail) return@onSuccess
                         maxBytes = info.maxBytes
                         remaining = info.quotaRemaining
-                        resetAt = info.quotaReset
+                        resetAt = info.quotaReset.takeIf { it > 0L }
                         err = false
+                        // remember per-account numbers: the next switch shows
+                        // them instantly, and the reset date reaches the keys
+                        val previousReset = app.accountVault.quotaSnapshot(myEmail)?.resetAtEpochSeconds ?: 0L
+                        app.accountVault.saveQuotaSnapshot(myEmail, info.maxBytes, info.quotaRemaining, info.quotaReset)
+                        if (info.quotaReset > 0L && info.quotaReset != previousReset) {
+                            // new monthly cycle — stamp the fresh reset date on
+                            // this account's keys so clients see the new date
+                            runCatching { app.gistRegistry.updateResetsForAccount(myEmail, info.quotaReset) }
+                        }
                         // the active row may still carry a placeholder label —
                         // resolve its real e-mail once and merge duplicates
                         val active = app.accountVault.activeAccount()
@@ -789,6 +811,8 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                                         revoked = false,
                                     ),
                                     mintingAccount = activeAccountEmail,
+                                    resetAtEpochSeconds = app.accountVault
+                                        .quotaSnapshot(activeAccountEmail)?.resetAtEpochSeconds ?: 0L,
                                 )
                                 issuedKey = key
                             } catch (c: CancellationException) {

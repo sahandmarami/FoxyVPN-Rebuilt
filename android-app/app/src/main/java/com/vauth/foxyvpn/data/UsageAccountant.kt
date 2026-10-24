@@ -110,6 +110,9 @@ object UsageAccountant {
                     if (sync.reportedUsedBytes > usedBytes.get()) {
                         ingestExternalUsed(sync.reportedUsedBytes)
                     }
+                    if (sync.resetAtEpochSeconds > 0L) {
+                        noteQuotaReset(sync.resetAtEpochSeconds)
+                    }
                 }
             }
         }

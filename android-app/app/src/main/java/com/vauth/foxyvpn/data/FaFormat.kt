@@ -76,7 +76,7 @@ object FaFormat {
         val remainingMs = resetAtEpochSec * 1000L - nowMillis
         if (remainingMs <= 0L) return "حجم ماهانه تازه شد ✓"
         val days = (remainingMs + DAY_MS - 1L) / DAY_MS // rounded up, at least 1
-        return "شارژ دوبارهٔ حجم: ${faDigits(days)} روز دیگر"
+        return "${faDigits(days)} روز تا شارژ دوبارهٔ حجم"
     }
 
     private const val DAY_MS = 86_400_000L

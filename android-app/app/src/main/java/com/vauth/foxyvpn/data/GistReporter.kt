@@ -111,6 +111,8 @@ object GistReporter {
         val reported: Boolean,
         /** Usage another device (or an earlier session) last reported — for resuming. */
         val reportedUsedBytes: Long = 0L,
+        /** Monthly quota-reset timestamp the distributor's keygen attached to this key. */
+        val resetAtEpochSeconds: Long = 0L,
     )
 
     /**
@@ -133,12 +135,14 @@ object GistReporter {
             }
             var revoked = false
             var present = false
+            var resetAt = 0L
             gist.first.optJSONArray("keys")?.let { keys ->
                 for (i in 0 until keys.length()) {
                     val entry = keys.optJSONObject(i) ?: continue
                     if (entry.optString("id") == ctx.keyId) {
                         present = true
                         revoked = entry.optBoolean("revoked", false)
+                        resetAt = entry.optLong("reset", 0L)
                         break
                     }
                 }
@@ -149,7 +153,7 @@ object GistReporter {
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
-            val reported = patchUsage(gist.second, ctx, usedBytes, status)
+            val reported = patchUsage(gist.second, ctx, usedBytes, status) >= 0
             if (!reported) AppLogger.d(TAG, "gist sync: usage patch failed (will retry)")
             val reportedUsed = gist.second.optJSONObject("usages")
                 ?.optJSONObject(ctx.keyId)?.optLong("used", 0L) ?: 0L
@@ -158,6 +162,7 @@ object GistReporter {
                 present = present,
                 reported = reported,
                 reportedUsedBytes = reportedUsed,
+                resetAtEpochSeconds = resetAt,
             )
         } finally {
             inFlight.set(false)
@@ -220,24 +225,30 @@ object GistReporter {
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
-            patchUsage(gist.second, ctx, usedBytes, status)
+            patchUsage(gist.second, ctx, usedBytes, status) >= 0
         } finally {
             inFlight.set(false)
         }
     }
 
-    /** Writes [usedBytes] into the usage map of [usageDoc] and patches the gist. */
-    private fun patchUsage(usageDoc: JSONObject, ctx: ReportContext, usedBytes: Long, status: String): Boolean {
+    /** Writes [usedBytes] into the usage map of [usageDoc] and patches the gist.
+     *  Monotonic: a client never LOWERS the stored usage — a friend who just
+     *  reinstalled (counter at 0) must not wipe the dashboard's real number.
+     *  The pre-write value is returned so callers can restore their counter. */
+    private fun patchUsage(usageDoc: JSONObject, ctx: ReportContext, usedBytes: Long, status: String): Long {
         val usage = usageDoc
         val usages = usage.optJSONObject("usages") ?: JSONObject().also { usage.put("usages", it) }
+        val previous = usages.optJSONObject(ctx.keyId)
+        val previousUsed = previous?.optLong("used", 0L) ?: 0L
         usages.put(
             ctx.keyId,
             JSONObject()
-                .put("used", usedBytes)
+                .put("used", maxOf(usedBytes, previousUsed))
                 .put("status", status)
                 .put("updated", System.currentTimeMillis() / 1000L),
         )
-        return patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString())
+        val ok = patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString())
+        return if (ok) previousUsed else -1L
     }
 
     private fun fetchGist(gistId: String, ghToken: String): Pair<JSONObject, JSONObject>? {

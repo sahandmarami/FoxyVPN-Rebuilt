@@ -129,7 +129,7 @@ class GistRegistry(context: Context) {
         rows.sortedByDescending { it.issuedAt }
     }
 
-    suspend fun addKey(row: KeyRow, mintingAccount: String = "") = withContext(Dispatchers.IO) {
+    suspend fun addKey(row: KeyRow, mintingAccount: String = "", resetAtEpochSeconds: Long = 0L) = withContext(Dispatchers.IO) {
         val gist = fetchGist(gistId, githubToken) ?: throw Exception("خواندن مخزن ناموفق بود")
         val registry = gist.first
         val keys = registry.optJSONArray("keys") ?: JSONArray().also { registry.put("keys", it) }
@@ -142,9 +142,32 @@ class GistRegistry(context: Context) {
                 .put("exp", row.exp)
                 .put("issued", row.issuedAt)
                 .put("revoked", false)
-                .put("acct", mintingAccount),
+                .put("acct", mintingAccount)
+                .put("reset", resetAtEpochSeconds),
         )
         patchFile("registry.json", registry.toString())
+    }
+
+    /**
+     * Stamps the account's current monthly reset timestamp on every key minted
+     * from [email]. The FoxyVPN client reads it during its gist sync and shows
+     * «N روز تا شارژ دوبارهٔ حجم» even when the VPN has never been connected.
+     * Called only when the value actually changes, so the gist is not hammered.
+     */
+    suspend fun updateResetsForAccount(email: String, resetAtEpochSeconds: Long) = withContext(Dispatchers.IO) {
+        if (email.isBlank() || resetAtEpochSeconds <= 0L) return@withContext
+        val gist = fetchGist(gistId, githubToken) ?: return@withContext
+        val registry = gist.first
+        val keys = registry.optJSONArray("keys") ?: JSONArray()
+        var changed = false
+        for (i in 0 until keys.length()) {
+            val entry = keys.optJSONObject(i) ?: continue
+            if (entry.optString("acct") == email && entry.optLong("reset", 0L) != resetAtEpochSeconds) {
+                entry.put("reset", resetAtEpochSeconds)
+                changed = true
+            }
+        }
+        if (changed) patchFile("registry.json", registry.toString())
     }
 
     suspend fun setRevoked(keyId: String, revoked: Boolean) = withContext(Dispatchers.IO) {

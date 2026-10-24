@@ -62,6 +62,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vauth.foxyvpn.BuildConfig
 import com.vauth.foxyvpn.FoxyVpnApp
 import com.vauth.foxyvpn.data.FaFormat
 import com.vauth.foxyvpn.data.QuotaKeyPayload
@@ -171,6 +172,14 @@ fun HomeScreen(
                     "اینترنت آزاد",
                     fontSize = 12.sp,
                     color = Color(0xFF7A8794),
+                )
+                // visible version so «کدام نسخه نصب است؟» همیشه روی صفحه جواب دارد
+                Text(
+                    "v" + BuildConfig.VERSION_NAME,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF98A2AE),
+                    modifier = Modifier.padding(start = 6.dp),
                 )
                 Spacer(Modifier.weight(1f))
                 Icon(

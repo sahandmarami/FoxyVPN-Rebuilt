@@ -1,0 +1,38 @@
+name: build-desktop
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths: [ 'desktop-app/**' ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Install go-winres
+        run: go install github.com/tc-hib/go-winres@latest
+
+      - name: Generate Windows resources
+        run: go-winres make --in winres/winres.json --out rsrc
+
+      - name: Test
+        run: go test ./... -timeout 300s
+
+      - name: Build (GUI subsystem)
+        run: go build -trimpath -ldflags "-s -w -H windowsgui" -o FoxyVPN-Desktop.exe .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FoxyVPN-Desktop
+          path: desktop-app/FoxyVPN-Desktop.exe

@@ -19,7 +19,7 @@ import (
         "strings"
 )
 
-const appVersion = "1.0.0"
+const appVersion = "1.1.0"
 
 // devMockHook is set only in devmock builds (go build -tags devmock).
 var devMockHook func(port int)

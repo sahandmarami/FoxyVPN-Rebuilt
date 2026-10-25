@@ -155,6 +155,67 @@
   .logbox .w{color:#f5c56b;} .logbox .e{color:#ff8a97;} .logbox .d{color:#6f87a0;}
 
   .center-note{text-align:center; color:var(--muted); font-size:12px; padding:30px 10px; line-height:2;}
+
+  /* ================= desktop sizing: the window is big — use it ================= */
+  @media (min-width: 760px){
+    header{padding:20px 30px 10px;}
+    .brand svg{width:32px; height:32px;}
+    .brand .name{font-size:21px;}
+    .ver{font-size:12.5px;}
+
+    main{width:100%; max-width:1140px; margin:0 auto; padding:10px 30px 16px;}
+
+    /* key screen: a comfortable centered column */
+    #view-key{max-width:560px; margin:0 auto; width:100%;}
+    .logo-big{width:112px; height:112px; border-radius:32px; margin-bottom:18px;}
+    .logo-big svg{width:68px; height:68px;}
+    #view-key h1{font-size:26px;}
+    #view-key p.sub{font-size:14.5px; margin-bottom:26px;}
+    .key-input{padding:16px 18px; font-size:15.5px; border-radius:16px;}
+    .btn{padding:15px; font-size:17px; border-radius:16px;}
+    .err{font-size:14px;}
+    .hint{font-size:12.5px;}
+
+    /* home: power column on one side, live data on the other */
+    #view-home{display:grid; grid-template-columns:5fr 7fr; gap:8px 36px; align-items:center; align-content:center; min-height:100%;}
+    .power-wrap{grid-column:1; grid-row:1 / span 3; padding:0;}
+    .power{width:224px; height:224px;}
+    .power svg{width:84px; height:84px;}
+    .status-pill{margin-top:24px; padding:11px 22px; font-size:15.5px;}
+    .status-sub{font-size:12.5px; margin-top:9px; max-width:340px;}
+    .stats{grid-column:2; grid-row:1; gap:12px; margin:0;}
+    .stat{padding:16px 10px; border-radius:16px;}
+    .stat .v{font-size:20px;}
+    .stat .k{font-size:12.5px; margin-top:5px;}
+    .server-card{grid-column:2; grid-row:2; padding:16px 18px; border-radius:16px; margin-top:0;}
+    .flag{width:42px; height:42px; font-size:14px; border-radius:12px;}
+    .server-name{font-size:15.5px;}
+    .server-sub{font-size:12.5px;}
+    .usage{grid-column:2; grid-row:3; padding:15px 18px; border-radius:16px; margin-top:0;}
+    .usage-row{font-size:13px; margin-bottom:9px;}
+    .usage-row b{font-size:14px;}
+    .bar{height:10px;}
+    .sync-line{font-size:12px;}
+
+    /* servers: wide two-column grid of cards */
+    #view-servers .list{display:grid; grid-template-columns:1fr 1fr; gap:10px; background:none; border:none; border-radius:0; overflow:visible;}
+    #view-servers .row,
+    #view-servers .row:last-child{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px 16px; font-size:14.5px;}
+    .section-title{font-size:14px; margin:12px 2px 10px;}
+    .row{font-size:14px; padding:14px 16px;}
+
+    /* settings: two columns — key+options on one side, live log on the other */
+    #view-settings{display:grid; grid-template-columns:11fr 9fr; gap:0 30px; align-items:start;}
+    #view-settings .set-col{min-width:0;}
+    .logbox{height:480px; font-size:11.5px; padding:14px;}
+    .toggle{width:48px; height:27px;}
+    .toggle i{width:21px; height:21px;}
+    .toggle.on i{transform:translateX(-21px);}
+
+    nav{padding:10px 16px 14px;}
+    .tab{font-size:12.5px; padding:8px 26px;}
+    .tab svg{width:23px; height:23px;}
+  }
 </style>
 </head>
 <body>
@@ -170,7 +231,7 @@
     </svg>
     <span class="name">FoxyVPN</span>
   </div>
-  <span class="ver" id="hdr-ver">v1.0.0</span>
+  <span class="ver" id="hdr-ver">v1.1.0</span>
 </header>
 
 <main>
@@ -215,7 +276,7 @@
       <div class="flag" id="srv-flag">--</div>
       <div class="server-meta">
         <div class="server-name" id="srv-name">خودکار (بهترین سرور)</div>
-        <div class="server-sub" id="srv-sub">برای انتخاب سرور لمس کنید</div>
+        <div class="server-sub" id="srv-sub">برای انتخاب سرور کلیک کنید</div>
       </div>
       <span class="lat" id="srv-lat"></span>
       <span class="chev">❯</span>
@@ -236,29 +297,32 @@
 
   <!-- ================= SETTINGS ================= -->
   <section id="view-settings" class="hidden">
-    <div class="section-title">کلید فعال</div>
-    <div class="list" id="key-card"></div>
+    <div class="set-col">
+      <div class="section-title">کلید فعال</div>
+      <div class="list" id="key-card"></div>
 
-    <div class="section-title">تنظیمات</div>
-    <div class="list">
-      <div class="row" style="cursor:default">
-        <div class="grow">پروکسی سیستمی<div class="sub">با وصل‌شدن روشن و با قطع‌شدن برگردانده می‌شود</div></div>
-        <div class="toggle" id="tg-sysproxy"><i></i></div>
+      <div class="section-title">تنظیمات</div>
+      <div class="list">
+        <div class="row" style="cursor:default">
+          <div class="grow">پروکسی سیستمی<div class="sub">با وصل‌شدن روشن و با قطع‌شدن برگردانده می‌شود</div></div>
+          <div class="toggle" id="tg-sysproxy"><i></i></div>
+        </div>
+        <div class="row" style="cursor:default">
+          <div class="grow">اتصال خودکار هنگام باز شدن برنامه</div>
+          <div class="toggle" id="tg-autoconn"><i></i></div>
+        </div>
       </div>
-      <div class="row" style="cursor:default">
-        <div class="grow">اتصال خودکار هنگام باز شدن برنامه</div>
-        <div class="toggle" id="tg-autoconn"><i></i></div>
+
+      <div class="list" style="margin-top:12px">
+        <div class="row" id="btn-remove" style="color:var(--red); font-weight:700;">حذف کلید از این دستگاه</div>
+        <div class="row" id="btn-exit" style="cursor:default">
+          <div class="grow">نسخه<div class="sub" id="settings-ver">FoxyVPN Desktop</div></div>
+        </div>
       </div>
     </div>
-
-    <div class="section-title">گزارش زنده</div>
-    <div class="logbox" id="logbox"></div>
-
-    <div class="list" style="margin-top:12px">
-      <div class="row" id="btn-remove" style="color:var(--red); font-weight:700;">حذف کلید از این دستگاه</div>
-      <div class="row" id="btn-exit" style="cursor:default">
-        <div class="grow">نسخه<div class="sub" id="settings-ver">FoxyVPN Desktop</div></div>
-      </div>
+    <div class="set-col">
+      <div class="section-title">گزارش زنده</div>
+      <div class="logbox" id="logbox"></div>
     </div>
   </section>
 </main>

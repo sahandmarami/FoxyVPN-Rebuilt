@@ -563,8 +563,21 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
         }
         errText = null
         var first = true
+        // a monthly-reset stamp GitHub refused earlier is retried on later
+        // cycles (every ~5 min) until it finally lands in the registry
+        var pendingResetStamp = 0L
+        var stampSkip = 0
         while (true) {
             if (app.accountVault.activeAccount()?.email != myEmail) break
+            if (pendingResetStamp > 0L) {
+                if (stampSkip > 0) {
+                    stampSkip--
+                } else {
+                    runCatching { app.gistRegistry.updateResetsForAccount(myEmail, pendingResetStamp) }
+                        .onSuccess { pendingResetStamp = 0L }
+                        .onFailure { stampSkip = 5 }
+                }
+            }
             app.accountVault.syncActiveFrom(app.tokenStore)
             val token = runCatching { app.authRepository.currentAccessToken() }.getOrNull()
             if (token != null) {
@@ -588,7 +601,9 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                         if (newReset > 0L && newReset != previousReset) {
                             // new monthly cycle — stamp the fresh reset date on
                             // this account's keys so clients see the new date
+                            pendingResetStamp = newReset
                             runCatching { app.gistRegistry.updateResetsForAccount(myEmail, newReset) }
+                                .onSuccess { pendingResetStamp = 0L }
                         }
                         // the active row may still carry a placeholder label —
                         // resolve its real e-mail once and merge duplicates
@@ -1035,6 +1050,9 @@ private fun KeysTab(app: KeygenApp) {
     var deleteTarget by remember { mutableStateOf<GistRegistry.KeyRow?>(null) }
     var repoOk by remember { mutableStateOf<Boolean?>(null) }
     var repoText by remember { mutableStateOf("") }
+    var writeProbeBusy by remember { mutableStateOf(false) }
+    var reissuedKey by remember { mutableStateOf<String?>(null) }
+    val clipboard = LocalClipboardManager.current
 
     fun refresh() {
         scope.launch {
@@ -1062,6 +1080,61 @@ private fun KeysTab(app: KeygenApp) {
         }
     }
 
+    /**
+     * Re-mints a replacement key with the SAME plan (size/expiry/account) —
+     * the escape hatch when the registry moves to a fresh gist and old keys
+     * keep pointing at the dead one.
+     */
+    fun reissue(row: GistRegistry.KeyRow) {
+        busyId = row.id
+        err = null
+        scope.launch {
+            try {
+                if (!app.gistRegistry.isReady) {
+                    throw Exception("اول اتصال گیت‌هاب را در تب «ساخت کلید» انجام دهید")
+                }
+                val vaultAccount = app.accountVault.accounts.firstOrNull { it.email == row.acct }
+                val refreshToken = vaultAccount?.refreshToken?.takeIf { it.isNotBlank() }
+                    ?: throw Exception(
+                        "اکانت «${row.acct}» در کلیدساز در دسترس نیست — اول از منوی بالا واردش کنید، بعد کلید جایگزین بسازید",
+                    )
+                val key = QuotaKeyCodec.mint(
+                    name = row.name,
+                    gb = row.gb,
+                    mb = row.mb,
+                    expiresAtEpochSeconds = row.exp,
+                    refreshToken = refreshToken,
+                    gistId = app.gistRegistry.gistId,
+                    githubToken = app.gistRegistry.githubToken,
+                    privateKeyB64 = BuildConfig.FOXY_PRIVATE_KEY,
+                )
+                if (!QuotaKeyCodec.verifySelf(key)) {
+                    throw Exception("خودآزمایی امضا ناموفق بود — کلید امضای این نسخه با کلید عمومی برنامهٔ اصلی هم‌خوانی ندارد")
+                }
+                app.gistRegistry.addKey(
+                    GistRegistry.KeyRow(
+                        id = extractId(key),
+                        name = row.name,
+                        gb = row.gb,
+                        mb = row.mb,
+                        exp = row.exp,
+                        issuedAt = System.currentTimeMillis() / 1000L,
+                        revoked = false,
+                    ),
+                    mintingAccount = row.acct,
+                    resetAtEpochSeconds = row.reset,
+                )
+                reissuedKey = key
+            } catch (c: CancellationException) {
+                throw c
+            } catch (e: Exception) {
+                err = e.message
+            } finally {
+                busyId = null
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         refresh()
         while (true) {
@@ -1070,7 +1143,12 @@ private fun KeysTab(app: KeygenApp) {
         }
     }
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp),
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1090,6 +1168,23 @@ private fun KeysTab(app: KeygenApp) {
             )
             Spacer(Modifier.height(4.dp))
         }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = {
+                writeProbeBusy = true
+                scope.launch {
+                    val (ok, probeError) = app.gistRegistry.writeProbe()
+                    writeProbeBusy = false
+                    repoOk = ok
+                    repoText = if (ok) "نوشتن در مخزن سالم است ✓" else (probeError ?: "نوشتن در مخزن ناموفق بود")
+                }
+            },
+            enabled = !writeProbeBusy && app.gistRegistry.isReady,
+            shape = RoundedCornerShape(10.dp),
+        ) {
+            Text(if (writeProbeBusy) "در حال تست نوشتن…" else "تست نوشتن در مخزن", fontSize = 12.sp)
+        }
+        Spacer(Modifier.height(2.dp))
         if (loading && rows.isEmpty()) {
             Box(Modifier.fillMaxWidth().padding(30.dp), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(color = accent, modifier = Modifier.size(26.dp), strokeWidth = 2.dp)
@@ -1126,10 +1221,33 @@ private fun KeysTab(app: KeygenApp) {
                         }
                     },
                     onDelete = { deleteTarget = row },
+                    onReissue = { reissue(row) },
                 )
             }
         }
         Spacer(Modifier.height(20.dp))
+    }
+
+    reissuedKey?.let { key ->
+        AlertDialog(
+            onDismissRequest = { reissuedKey = null },
+            title = { Text("کلید جایگزین آماده است", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "همان حجم و مهلت قبلی را دارد و از سهمیهٔ همان اکانت کسر می‌شود. کلید تازه را جای کلید قبلی به کاربر بدهید و بعد کلید قبلی را باطل یا حذف کنید.\n\n$key",
+                    fontSize = 12.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    clipboard.setText(AnnotatedString(key))
+                    Toast.makeText(app, "کلید کپی شد", Toast.LENGTH_SHORT).show()
+                }) { Text("کپی کلید") }
+            },
+            dismissButton = {
+                TextButton(onClick = { reissuedKey = null }) { Text("بستن") }
+            },
+        )
     }
 
     deleteTarget?.let { target ->
@@ -1177,6 +1295,7 @@ private fun KeyRowCard(
     row: GistRegistry.KeyRow,
     busy: Boolean,
     onToggle: () -> Unit,
+    onReissue: () -> Unit,
     onDelete: () -> Unit,
 ) {
     val accent = rememberKeygenAccent()
@@ -1294,6 +1413,14 @@ private fun KeyRowCard(
                 }
                 Spacer(Modifier.width(8.dp))
                 OutlinedButton(
+                    onClick = onReissue,
+                    enabled = !busy,
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Text("کلید جایگزین", fontSize = 12.sp)
+                }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(
                     onClick = onDelete,
                     enabled = !busy,
                     shape = RoundedCornerShape(10.dp),
@@ -1307,7 +1434,7 @@ private fun KeyRowCard(
             if (!row.revoked) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "باطل‌سازی تا حدود نیم دقیقه بعد روی گوشی کاربر اعمال می‌شود",
+                    "باطل‌سازی در اولین گزارش بعدی روی گوشی کاربر اعمال می‌شود (حدود چند دقیقه)",
                     fontSize = 10.sp,
                     color = Color(0xFF97A1AC),
                 )

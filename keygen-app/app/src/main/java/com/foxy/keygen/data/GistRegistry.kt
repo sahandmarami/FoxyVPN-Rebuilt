@@ -313,6 +313,70 @@ class GistRegistry(context: Context) {
         }
     }
 
+    /**
+     * One explicit WRITE probe: PATCHes registry.json back with its own
+     * content. Reads can stay green while GitHub refuses writes — this is
+     * the only honest test of the reporting channel. The button stays manual
+     * so it never adds to the write volume by itself.
+     */
+    suspend fun writeProbe(): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
+        if (!isReady) return@withContext false to "اول اتصال گیت‌هاب را انجام دهید"
+        runCatching {
+            val read = fetchGistDetailed(gistId, githubToken)
+            val registry = read.pair?.first ?: throw Exception(
+                when (read.httpCode) {
+                    404 -> "مخزن خوانده نشد (۴۰۴) — مخزن تازه بسازید"
+                    403 -> "خواندن مخزن رد شد (۴۰۳) — دسترسی gist توکن را بررسی کنید"
+                    else -> "خواندن مخزن ناموفق بود (HTTP ${read.httpCode})"
+                },
+            )
+            val request = Request.Builder()
+                .url("https://api.github.com/gists/$gistId")
+                .header("Authorization", "Bearer $githubToken")
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "FoxyKeygen")
+                .patch(
+                    JSONObject()
+                        .put(
+                            "files",
+                            JSONObject().put("registry.json", JSONObject().put("content", registry.toString())),
+                        )
+                        .toString()
+                        .toRequestBody("application/json".toMediaType()),
+                )
+                .build()
+            ControlPlaneHttp.client.newCall(request).execute().use { resp ->
+                if (resp.code in 200..299) {
+                    true
+                } else {
+                    throw Exception(
+                        writeFailureMessage(resp.code, runCatching { resp.body?.string().orEmpty() }.getOrDefault("")),
+                    )
+                }
+            }
+        }.let { result ->
+            if (result.isSuccess) true to null
+            else false to (result.exceptionOrNull()?.message ?: "نوشتن در مخزن ناموفق بود")
+        }
+    }
+
+    /** Precise, display-ready Persian reason for a refused gist write. */
+    private fun writeFailureMessage(code: Int, body: String): String {
+        val low = body.lowercase()
+        return when {
+            code == 403 && listOf("abuse", "secondary", "rate limit", "temporarily").any { it in low } ->
+                "گیت‌هاب به‌طور موقت نوشتن را بسته است (سقف درخواست/سوءاستفاده) — بعد از چند دقیقه یا ساعت خودش باز می‌شود"
+            code == 403 && listOf("spam", "flagged", "blocked", "terms", "tos").any { it in low } ->
+                "گیت‌هاب این مخزن را بلاک کرده است — از «تست/بازسازی اتصال» مخزن تازه بسازید و برای هر کاربر «کلید جایگزین» بدهید"
+            code == 403 ->
+                "گیت‌هاب اجازهٔ نوشتن در این مخزن را نداد (۴۰۳) — دسترسی gist توکن را بررسی کنید یا مخزن تازه بسازید"
+            code == 401 ->
+                "توکن گیت‌هاب نامعتبر است (۴۰۱) — توکن تازه بسازید و دوباره وصل کنید"
+            else ->
+                "به‌روزرسانی مخزن ناموفق بود (HTTP $code)"
+        }
+    }
+
     private fun readFile(files: JSONObject, name: String, token: String): String? {
         val file = files.optJSONObject(name) ?: return null
         return runCatching {
@@ -349,7 +413,10 @@ class GistRegistry(context: Context) {
             .patch(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
         ControlPlaneHttp.client.newCall(request).execute().use { resp ->
-            if (resp.code !in 200..299) throw Exception("به‌روزرسانی مخزن ناموفق بود (HTTP ${resp.code})")
+            if (resp.code !in 200..299) {
+                val body = runCatching { resp.body?.string().orEmpty() }.getOrDefault("")
+                throw Exception(writeFailureMessage(resp.code, body))
+            }
             return true
         }
     }

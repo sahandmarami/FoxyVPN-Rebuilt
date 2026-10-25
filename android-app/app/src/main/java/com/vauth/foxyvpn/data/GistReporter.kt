@@ -50,8 +50,8 @@ object GistReporter {
         SyncIssue.NONE -> ""
         SyncIssue.NETWORK -> "شبکه در دسترس نیست؛ با اتصال VPN دوباره تلاش می‌شود"
         SyncIssue.AUTH -> "توکن مخزن نامعتبر است — کلید جدید از کلیدساز بگیرید"
-        SyncIssue.FORBIDDEN -> "توکن دسترسی Gist ندارد — در کلیدساز مخزن را دوباره وصل کنید"
-        SyncIssue.RATE_LIMITED -> "سقف درخواست گیت‌هاب پر شده؛ کمی بعد تلاش می‌شود"
+        SyncIssue.FORBIDDEN -> "گیت‌هاب نوشتن گزارش را رد کرد (۴۰۳) — در کلیدساز «تست نوشتن» را بزنید؛ اگر ادامه داشت مخزن تازه بسازید"
+        SyncIssue.RATE_LIMITED -> "گیت‌هاب موقتاً نوشتن را بسته (سقف/سوءاستفاده) — بعد از چند دقیقه خودش تلاش می‌کند"
         SyncIssue.NOT_FOUND -> "مخزن گزارش پیدا نشد — کلید جدید از کلیدساز بگیرید"
     }
 
@@ -88,6 +88,72 @@ object GistReporter {
         lastSyncAttemptAtMs = System.currentTimeMillis()
         if (issue != SyncIssue.NONE) lastSyncIssueLabel = issueLabel(issue)
     }
+
+    // ---- write discipline -----------------------------------------------
+    // GitHub flags gists that are PATCHed hundreds of times per hour as
+    // abuse and then refuses ALL writes (HTTP 403) while reads keep working
+    // — the «توکن دسترسی Gist ندارد» / «HTTP 403» storm. The old build
+    // reported every 20s from EVERY device; now writes are deduped, gap-
+    // limited and backed off exponentially so the channel never trips again.
+    private class WriteState {
+        @Volatile var lastWriteOkAtMs: Long = 0L
+        @Volatile var lastWrittenUsed: Long = -1L
+        @Volatile var cooldownUntilMs: Long = 0L
+        @Volatile var backoffIndex: Int = 0
+        @Volatile var lastWriteIssue: SyncIssue = SyncIssue.NONE
+    }
+
+    private val writeStates = java.util.concurrent.ConcurrentHashMap<String, WriteState>()
+
+    private fun writeStateFor(keyId: String): WriteState = writeStates.getOrPut(keyId) { WriteState() }
+
+    private val WRITE_BACKOFF_STEPS_MS =
+        longArrayOf(5L, 15L, 45L, 90L).map { it * 60_000L }.toLongArray()
+
+    /** Minimum gap between two successful usage writes of the same key. */
+    private const val MIN_WRITE_GAP_MS = 3L * 60_000L
+    /** Smallest usage delta that justifies an earlier write. */
+    private const val WRITE_DELTA_BYTES = 512L * 1024L
+    /** Idle connections still refresh their status at this cadence. */
+    private const val IDLE_WRITE_HEARTBEAT_MS = 15L * 60_000L
+
+    /** Whole-channel read cooldown (GET refused with 403/429 — primary limit). */
+    @Volatile private var readCooldownUntilMs: Long = 0L
+    @Volatile private var readBackoffIndex: Int = 0
+
+    /**
+     * When >0, regular usage patches pause until a successful period-reset
+     * push zeroes the stored entry (monthly recharge) — otherwise the
+     * monotonic patch would keep re-raising the previous month's number.
+     */
+    @Volatile var suspendPatchesForPeriodStartSec: Long = 0L
+
+    /** Body of the last failed HTTP answer, for precise 403 classification. */
+    @Volatile private var lastErrorBody: String = ""
+
+    /** true = write now; false = skip (data already current or cooling down). */
+    private fun shouldAttemptWrite(st: WriteState, usedBytes: Long, nowMs: Long): Boolean {
+        if (st.lastWriteOkAtMs <= 0L) return true
+        if (usedBytes < st.lastWrittenUsed) return true // a reset legitimately lowers it
+        val changed = usedBytes - st.lastWrittenUsed >= WRITE_DELTA_BYTES
+        val gapOver = nowMs - st.lastWriteOkAtMs >= MIN_WRITE_GAP_MS
+        val heartbeat = nowMs - st.lastWriteOkAtMs >= IDLE_WRITE_HEARTBEAT_MS
+        return (changed && gapOver) || heartbeat
+    }
+
+    /** Arms the exponential write cooldown after a refused write. */
+    private fun armWriteBackoff(st: WriteState, httpCode: Int, nowMs: Long) {
+        val idx = minOf(st.backoffIndex, WRITE_BACKOFF_STEPS_MS.size - 1)
+        st.cooldownUntilMs = nowMs + WRITE_BACKOFF_STEPS_MS[idx]
+        if (httpCode > 0) st.backoffIndex = minOf(st.backoffIndex + 1, WRITE_BACKOFF_STEPS_MS.size)
+        if (httpCode == -1) {
+            // network-level failure: a short cooldown, not the abuse ladder
+            st.cooldownUntilMs = nowMs + 2L * 60_000L
+        }
+    }
+
+    private fun writeIssueWhileCooling(st: WriteState): SyncIssue =
+        st.lastWriteIssue.takeIf { it != SyncIssue.NONE } ?: SyncIssue.RATE_LIMITED
 
     private var tunnelClient: OkHttpClient? = null
     private var tunnelClientPort: Int = 0
@@ -217,14 +283,22 @@ object GistReporter {
     ): SyncResult? = withContext(Dispatchers.IO) {
         if (!inFlight.compareAndSet(false, true)) return@withContext null
         try {
+            if (System.currentTimeMillis() < readCooldownUntilMs) return@withContext null
             val fetch = fetchGist(ctx.gistId, ctx.token)
             val gist = fetch.snapshot
             if (gist == null) {
                 // the gist was not even read: offline / token / deleted gist
                 AppLogger.d(TAG, "gist sync failed: ${fetch.issue} (${fetch.detail})")
+                if (fetch.issue == SyncIssue.RATE_LIMITED) {
+                    val idx = minOf(readBackoffIndex, WRITE_BACKOFF_STEPS_MS.size - 1)
+                    readCooldownUntilMs = System.currentTimeMillis() + WRITE_BACKOFF_STEPS_MS[idx]
+                    readBackoffIndex++
+                    AppLogger.d(TAG, "gist reads refused; cooling down ${WRITE_BACKOFF_STEPS_MS[idx] / 60_000L} min")
+                }
                 noteFailure(fetch.issue)
                 return@withContext null
             }
+            readBackoffIndex = 0
             var revoked = false
             var present = false
             var resetAt = 0L
@@ -247,11 +321,45 @@ object GistReporter {
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
-            val patchCode = patchUsage(gist.usage, ctx, usedBytes, status)
-            val reported = patchCode in 200..299
-            val issue = when {
-                reported -> SyncIssue.NONE
-                else -> classifyHttp(patchCode)
+            val st = writeStateFor(ctx.keyId)
+            val nowMs = System.currentTimeMillis()
+            var reported: Boolean
+            var issue: SyncIssue
+            when {
+                suspendPatchesForPeriodStartSec > 0L -> {
+                    // a monthly reset is being pushed separately; a regular
+                    // patch would only re-raise the old number
+                    reported = true
+                    issue = SyncIssue.NONE
+                    AppLogger.d(TAG, "usage patch paused while the period reset is being pushed")
+                }
+                nowMs < st.cooldownUntilMs -> {
+                    reported = false
+                    issue = writeIssueWhileCooling(st)
+                    AppLogger.d(TAG, "usage write in cooldown for another ${(st.cooldownUntilMs - nowMs) / 60_000L} min")
+                }
+                shouldAttemptWrite(st, usedBytes, nowMs) -> {
+                    val patchCode = patchUsage(gist.usage, ctx, usedBytes, status)
+                    if (patchCode in 200..299) {
+                        st.lastWriteOkAtMs = nowMs
+                        st.lastWrittenUsed = usedBytes
+                        st.backoffIndex = 0
+                        reported = true
+                        issue = SyncIssue.NONE
+                    } else {
+                        issue = classifyHttp(patchCode)
+                        st.lastWriteIssue = issue
+                        armWriteBackoff(st, patchCode, nowMs)
+                        reported = false
+                        AppLogger.d(TAG, "gist sync: usage patch failed HTTP=$patchCode")
+                    }
+                }
+                else -> {
+                    // the dashboard already holds a current-enough number —
+                    // a healthy no-op, NOT a failure
+                    reported = true
+                    issue = SyncIssue.NONE
+                }
             }
             if (reported) {
                 AppLogger.d(
@@ -260,7 +368,6 @@ object GistReporter {
                 )
                 noteSuccess()
             } else {
-                AppLogger.d(TAG, "gist sync: usage patch failed HTTP=$patchCode")
                 noteFailure(issue)
             }
             val usageEntry = gist.usage.optJSONObject("usages")?.optJSONObject(ctx.keyId)
@@ -288,6 +395,7 @@ object GistReporter {
      */
     suspend fun isRevoked(ctx: ReportContext): Boolean = withContext(Dispatchers.IO) {
         runCatching {
+            if (System.currentTimeMillis() < readCooldownUntilMs) return@runCatching false
             val fetch = fetchGist(ctx.gistId, ctx.token)
             val registry = fetch.snapshot?.registry ?: return@runCatching false
             val keys = registry.optJSONArray("keys") ?: return@runCatching false
@@ -315,6 +423,7 @@ object GistReporter {
      */
     suspend fun fetchReportedUsage(ctx: ReportContext): Long? = withContext(Dispatchers.IO) {
         runCatching {
+            if (System.currentTimeMillis() < readCooldownUntilMs) return@runCatching null
             val fetch = fetchGist(ctx.gistId, ctx.token)
             fetch.snapshot?.usage
                 ?.optJSONObject("usages")?.optJSONObject(ctx.keyId)
@@ -334,21 +443,52 @@ object GistReporter {
         limitBytes: Long,
         expired: Boolean,
         statusOverride: String? = null,
+        force: Boolean = false,
     ): Boolean = withContext(Dispatchers.IO) {
         if (!inFlight.compareAndSet(false, true)) return@withContext false
         try {
+            val st = writeStateFor(ctx.keyId)
+            val nowMs = System.currentTimeMillis()
+            if (nowMs < readCooldownUntilMs) return@withContext false
+            if (nowMs < st.cooldownUntilMs && !force && statusOverride == null) {
+                // final statuses (exhausted/revoked/expired) always try —
+                // they are rare and matter more than the cooldown
+                noteFailure(writeIssueWhileCooling(st))
+                return@withContext false
+            }
+            if (
+                !force && statusOverride == null && suspendPatchesForPeriodStartSec <= 0L &&
+                !shouldAttemptWrite(st, usedBytes, nowMs)
+            ) {
+                // nothing new to tell the dashboard
+                return@withContext true
+            }
+            if (force && suspendPatchesForPeriodStartSec > 0L && statusOverride == null) {
+                // never overwrite a pending period reset with the old number
+                return@withContext true
+            }
             val fetch = fetchGist(ctx.gistId, ctx.token)
             val gist = fetch.snapshot ?: run {
                 noteFailure(fetch.issue)
                 return@withContext false
             }
+            readBackoffIndex = 0
             val status = statusOverride ?: when {
                 expired -> "expired"
                 limitBytes > 0 && usedBytes >= limitBytes -> "exhausted"
                 else -> "active"
             }
             val code = patchUsage(gist.usage, ctx, usedBytes, status)
-            if (code in 200..299) noteSuccess() else noteFailure(classifyHttp(code))
+            if (code in 200..299) {
+                st.lastWriteOkAtMs = System.currentTimeMillis()
+                st.lastWrittenUsed = usedBytes
+                st.backoffIndex = 0
+                noteSuccess()
+            } else {
+                st.lastWriteIssue = classifyHttp(code)
+                armWriteBackoff(st, code, nowMs)
+                noteFailure(st.lastWriteIssue)
+            }
             code in 200..299
         } finally {
             inFlight.set(false)
@@ -366,8 +506,10 @@ object GistReporter {
         withContext(Dispatchers.IO) {
             if (!inFlight.compareAndSet(false, true)) return@withContext false
             try {
+                if (System.currentTimeMillis() < readCooldownUntilMs) return@withContext false
                 val fetch = fetchGist(ctx.gistId, ctx.token)
                 val gist = fetch.snapshot ?: return@withContext false
+                readBackoffIndex = 0
                 val usage = gist.usage
                 val usages = usage.optJSONObject("usages") ?: JSONObject().also { usage.put("usages", it) }
                 usages.put(
@@ -378,7 +520,23 @@ object GistReporter {
                         .put("updated", System.currentTimeMillis() / 1000L)
                         .put("periodStart", periodStartEpochSeconds),
                 )
-                patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString()) in 200..299
+                val code = patchGist(ctx.gistId, ctx.token, "usage.json", usage.toString())
+                if (code in 200..299) {
+                    // the stored entry is zeroed - regular patches may resume
+                    suspendPatchesForPeriodStartSec = 0L
+                    val st = writeStateFor(ctx.keyId)
+                    st.lastWriteOkAtMs = System.currentTimeMillis()
+                    st.lastWrittenUsed = 0L
+                    st.backoffIndex = 0
+                    noteSuccess()
+                    true
+                } else {
+                    val st = writeStateFor(ctx.keyId)
+                    st.lastWriteIssue = classifyHttp(code)
+                    armWriteBackoff(st, code, System.currentTimeMillis())
+                    noteFailure(st.lastWriteIssue)
+                    false
+                }
             } finally {
                 inFlight.set(false)
             }
@@ -407,7 +565,11 @@ object GistReporter {
         code == 401 -> SyncIssue.AUTH
         code == 404 -> SyncIssue.NOT_FOUND
         code == 429 -> SyncIssue.RATE_LIMITED
-        code == 403 -> SyncIssue.FORBIDDEN
+        code == 403 -> {
+            val low = lastErrorBody.lowercase()
+            val transient = listOf("abuse", "secondary", "rate limit", "temporarily", "retry").any { it in low }
+            if (transient) SyncIssue.RATE_LIMITED else SyncIssue.FORBIDDEN
+        }
         else -> SyncIssue.NETWORK
     }
 
@@ -422,6 +584,7 @@ object GistReporter {
         val resp = execute(request) ?: return GistFetch(null, SyncIssue.NETWORK, "no response on either route")
         resp.use {
             if (it.code != 200) {
+                lastErrorBody = runCatching { it.body?.string().orEmpty() }.getOrDefault("")
                 return GistFetch(null, classifyHttp(it.code), "HTTP ${it.code} on gist read")
             }
             val body = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
@@ -483,7 +646,13 @@ object GistReporter {
             .patch(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
         execute(request)?.use { resp ->
-            return resp.code
+            val code = resp.code
+            if (code !in 200..299) {
+                lastErrorBody = runCatching { resp.body?.string().orEmpty() }.getOrDefault("")
+            } else {
+                lastErrorBody = ""
+            }
+            return code
         }
         return -1
     }

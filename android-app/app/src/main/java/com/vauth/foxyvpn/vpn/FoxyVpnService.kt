@@ -116,7 +116,7 @@ private const val WIFI_LOCK_TAG = "com.vauth.foxyvpn:vpn-wifi"
 private const val KEY_SUPERVISION_TICK_MS = 2_000L
 
 /** One gist round trip per interval: revocation check + live usage report. */
-private const val KEY_GIST_SYNC_INTERVAL_MS = 20_000L
+private const val KEY_GIST_SYNC_INTERVAL_MS = 240_000L
 
 /** Revocation re-check budget before opening a new tunnel. */
 private const val CONNECT_GIST_CHECK_TIMEOUT_MS = 8_000L
@@ -1227,6 +1227,7 @@ class FoxyVpnService : VpnService() {
                     // the month may have rolled over mid-session: lift a QUOTA
                     // block and zero the counter the moment volume re-grants
                     UsageAccountant.maybeApplyMonthlyReset()
+                    UsageAccountant.flushPendingPeriodReset()
                     if (UsageAccountant.blockReason != UsageAccountant.BlockReason.NONE) {
                         _lastError.value = keyBlockMessage(UsageAccountant.blockReason)
                         AppLogger.w(TAG, "quota key reached its limit mid-session: ${UsageAccountant.blockReason}")
@@ -1234,7 +1235,9 @@ class FoxyVpnService : VpnService() {
                         return@launch
                     }
                     // one combined round trip: registry (revoked?) + usage report;
-                    // keeps the distributor's dashboard within ~30s of this device
+                    // keeps the distributor's dashboard within ~4 min of this
+                    // device — writes are throttled so GitHub never flags the
+                    // gist for abuse again
                     if (now - lastSyncAt >= KEY_GIST_SYNC_INTERVAL_MS) {
                         lastSyncAt = now
                         val ctx = UsageAccountant.reporterContext()

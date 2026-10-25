@@ -270,11 +270,29 @@ object UsageAccountant {
         s.saveQuotaReset(id, next)
         val ctx = reporterContext
         if (ctx != null) {
-            scope.launch {
-                runCatching { GistReporter.pushPeriodReset(ctx, resetAt) }
-            }
+            // regular patches must not re-raise the old number while the
+            // zeroing push is still in flight
+            GistReporter.suspendPatchesForPeriodStartSec = resetAt
+            pendingPeriodResetSec = resetAt
+            scope.launch { pushPeriodResetSafely(ctx, resetAt) }
         }
         recomputeBlock(System.currentTimeMillis())
+    }
+
+    /** Monthly-reset push that still needs to land in the gist (0 = none). */
+    @Volatile private var pendingPeriodResetSec: Long = 0L
+
+    private suspend fun pushPeriodResetSafely(ctx: GistReporter.ReportContext, resetAt: Long) {
+        val ok = runCatching { GistReporter.pushPeriodReset(ctx, resetAt) }.getOrDefault(false)
+        if (ok) pendingPeriodResetSec = 0L
+    }
+
+    /** Retries a failed monthly-reset push on later ticks until it lands. */
+    fun flushPendingPeriodReset() {
+        val reset = pendingPeriodResetSec
+        if (reset <= 0L) return
+        val ctx = reporterContext ?: return
+        scope.launch { pushPeriodResetSafely(ctx, reset) }
     }
 
     fun quotaResetAt(): Long {
@@ -292,6 +310,7 @@ object UsageAccountant {
             limitBytes = limit,
             expired = blockReason == BlockReason.EXPIRED,
             statusOverride = finalStatus,
+            force = true,
         )
     }
 

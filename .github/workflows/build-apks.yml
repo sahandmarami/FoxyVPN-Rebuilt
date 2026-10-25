@@ -26,7 +26,7 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
-      - name: Build FoxyVPN (main app) v3.4.0 — standard identity
+      - name: Build FoxyVPN (main app) — standard identity
         working-directory: android-app
         env:
           SIGNING_STORE_PASSWORD: foxyvpn
@@ -34,12 +34,14 @@ jobs:
           SIGNING_KEY_PASSWORD: foxyvpn
         run: gradle assembleRelease --no-daemon --stacktrace
 
-      - name: Collect standard APK
+      - name: Collect standard APK (name from versionName)
         run: |
           mkdir -p out
-          cp android-app/app/build/outputs/apk/release/app-release.apk out/FoxyVPN-v3.4.0.apk
+          VER=$(grep -oP 'versionName = "\K[^"]+' android-app/app/build.gradle.kts | head -1)
+          cp android-app/app/build/outputs/apk/release/app-release.apk "out/FoxyVPN-v$VER.apk"
+          echo "MAIN_VER=$VER" >> "$GITHUB_ENV"
 
-      - name: Build FoxyVPN Fresh identity v3.4.0 (com.foxy.vpn)
+      - name: Build FoxyVPN Fresh identity (com.foxy.vpn)
         working-directory: android-app
         env:
           SIGNING_STORE_PASSWORD: foxyvpn
@@ -51,20 +53,21 @@ jobs:
 
       - name: Collect fresh-identity APK + verify package name
         run: |
-          cp android-app/app/build/outputs/apk/release/app-release.apk out/FoxyVPN-Fresh-v3.4.0.apk
+          cp android-app/app/build/outputs/apk/release/app-release.apk "out/FoxyVPN-Fresh-v$MAIN_VER.apk"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort | tail -1)
           echo "=== standard package ==="
-          "$BT/aapt" dump badging out/FoxyVPN-v3.4.0.apk | head -2
+          "$BT/aapt" dump badging "out/FoxyVPN-v$MAIN_VER.apk" | head -2
           echo "=== fresh package ==="
-          "$BT/aapt" dump badging out/FoxyVPN-Fresh-v3.4.0.apk | head -2
+          "$BT/aapt" dump badging "out/FoxyVPN-Fresh-v$MAIN_VER.apk" | head -2
 
-      - name: Build FoxyKeygen v2.3.0
+      - name: Build FoxyKeygen
         working-directory: keygen-app
         run: gradle assembleRelease --no-daemon --stacktrace
 
       - name: Collect APKs
         run: |
-          cp keygen-app/app/build/outputs/apk/release/app-release.apk out/FoxyKeygen-v2.3.0.apk
+          KEY_VER=$(grep -oP 'versionName = "\K[^"]+' keygen-app/app/build.gradle.kts | head -1)
+          cp keygen-app/app/build/outputs/apk/release/app-release.apk "out/FoxyKeygen-v$KEY_VER.apk"
           ls -la out
 
       - name: Upload APKs

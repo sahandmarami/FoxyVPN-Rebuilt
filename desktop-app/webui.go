@@ -86,8 +86,8 @@ func startNativeWindow(core *Core, panelURL, dataDir string) bool {
                 AutoFocus: true,
                 WindowOptions: webview2.WindowOptions{
                         Title:  windowTitle,
-                        Width:  winW,
-                        Height: winH,
+                        Width:  uint(winW),
+                        Height: uint(winH),
                         IconId: 1, // icon embedded by go-winres
                         Center: true,
                 },

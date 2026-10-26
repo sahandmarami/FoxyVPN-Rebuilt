@@ -526,6 +526,9 @@ private fun describeQuotaFailure(failure: Throwable): String {
     }
 }
 
+/** Below this gap the «گزارش‌نشده» note is just noise — not worth a line. */
+private const val UNACCOUNTED_VISIBLE_BYTES = 10_000_000L
+
 @Composable
 private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: String?) {
     val accent = rememberKeygenAccent()
@@ -533,6 +536,10 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
     var maxBytes by remember { mutableStateOf<Long?>(null) }
     var remaining by remember { mutableStateOf<Long?>(null) }
     var resetAt by remember { mutableStateOf<Long?>(null) }
+    // total usage the keys THEMSELVES reported into the gist — compared against
+    // Mozilla's own account counter so the un-reported remainder (old app
+    // versions / other devices) is visible instead of looking like a broken 0
+    var reportedBytes by remember { mutableStateOf<Long?>(null) }
     // the REAL reason of the last failure — never a blanket «اتصال را بررسی کنید»
     var errText by remember { mutableStateOf<String?>(null) }
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -626,6 +633,19 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
             } else if (first) {
                 errText = "نشست فعالی برای این اکانت نیست — دوباره واردش شوید"
             }
+            // sum the gist-reported usage of THIS account's keys (clients that
+            // do report); never-reported or previous-period rows count as 0
+            runCatching {
+                val all = app.gistRegistry.fetchRows()
+                if (all.isNotEmpty()) {
+                    val mine = all.filter { it.acct == myEmail }
+                    val pool = if (mine.isNotEmpty()) mine else all
+                    reportedBytes = pool.sumOf { row ->
+                        val stale = row.reset > 0 && row.updatedAt > 0 && row.updatedAt < row.reset
+                        if (stale || row.revoked) 0L else row.usedBytes
+                    }
+                }
+            }
             first = false
             delay(60_000L)
         }
@@ -646,25 +666,57 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                 color = Color(0xFF67737F),
             )
             Spacer(Modifier.height(4.dp))
+            // Mozilla's counter is the authority for the REAL drained quota:
+            // used = max - remaining. Leading with it answers «حجم رو حساب نمی‌کنه»
+            val usedBytes = if (remaining != null && maxBytes != null) {
+                (maxBytes!! - remaining!!).coerceAtLeast(0L)
+            } else null
             Text(
                 text = errText
                     ?: when {
-                        remaining != null && maxBytes != null -> "${formatBytesBinary(remaining!!)} از ${formatBytesBinary(maxBytes!!)} باقی مانده"
-                        remaining != null -> "${formatBytesBinary(remaining!!)} باقی مانده"
+                        usedBytes != null -> "مصرف‌شده: ${formatBytesBinary(usedBytes)} از ${formatBytesBinary(maxBytes!!)}"
+                        remaining != null -> "باقی‌مانده: ${formatBytesBinary(remaining!!)}"
                         else -> "…"
                     },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold,
                 color = if (errText != null) Color(0xFFB72749) else Color(0xFF17222C),
             )
-            if (remaining != null && maxBytes != null && maxBytes!! > 0) {
+            if (remaining != null && usedBytes != null) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "باقی‌مانده: ${formatBytesBinary(remaining!!)}",
+                    fontSize = 11.sp,
+                    color = Color(0xFF67737F),
+                )
+            }
+            if (usedBytes != null && maxBytes != null && maxBytes!! > 0) {
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
-                    progress = { (remaining!!.toFloat() / maxBytes!!.toFloat()).coerceIn(0f, 1f) },
+                    progress = { (usedBytes.toFloat() / maxBytes!!.toFloat()).coerceIn(0f, 1f) },
                     modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
                     color = accent,
                     trackColor = Color(0xFFEDF1F5),
                 )
+            }
+            reportedBytes?.let { rep ->
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "گزارش کلیدها: ${formatBytes(rep)}",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (rep > 0) Color(0xFF128A56) else Color(0xFF97A1AC),
+                )
+                val unaccounted = (usedBytes ?: 0L) - rep
+                if (unaccounted > UNACCOUNTED_VISIBLE_BYTES) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "≈ ${formatBytesBinary(unaccounted)} گزارش‌نشده — ترافیک دستگاه‌های دیگر یا اپ‌های قدیمی؛ " +
+                            "موزیلا آن را از سهمیهٔ همین اکانت کم می‌کند ولی در گزارش کلیدها نیست",
+                        fontSize = 10.sp,
+                        color = Color(0xFFB57A00),
+                    )
+                }
             }
             resetAt?.let { reset ->
                 Spacer(Modifier.height(6.dp))
@@ -1370,13 +1422,33 @@ private fun KeyRowCard(
             // previous-month data and the new month starts from zero.
             val stalePeriod = row.reset > 0 && row.updatedAt > 0 && row.updatedAt < row.reset
             val shownUsed = if (stalePeriod) 0L else row.usedBytes
-            Text(
-                "مصرف این ماه: ${formatBytes(shownUsed)}" +
-                    (if (row.updatedAt > 0 && !stalePeriod) "  ·  آخرین گزارش: " + formatTime(row.updatedAt) else ""),
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF17222C),
-            )
+            if (row.updatedAt == 0L && !row.revoked) {
+                // no client has EVER reported for this key: showing a fake 0 B
+                // read like a broken counter — say plainly where its usage lives
+                Text(
+                    "گزارشی از این کلید نرسیده",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF67737F),
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "اگر در حال استفاده است، مصرفش فقط در شمارندهٔ اکانت (بالای صفحه) دیده می‌شود — دستگاهش هنوز با اپ گزارش‌فرست وصل نشده",
+                    fontSize = 10.sp,
+                    color = Color(0xFF97A1AC),
+                )
+            } else {
+                Text(
+                    "مصرف این ماه: ${formatBytes(shownUsed)}" +
+                        (if (row.updatedAt > 0 && !stalePeriod)
+                            "  ·  آخرین گزارش: " + formatTime(row.updatedAt) +
+                            " (" + FaFormat.relativeAgoLabel(row.updatedAt, nowMs) + ")"
+                        else ""),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF17222C),
+                )
+            }
             if (stalePeriod) {
                 Spacer(Modifier.height(2.dp))
                 Text(

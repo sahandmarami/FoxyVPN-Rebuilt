@@ -79,5 +79,21 @@ object FaFormat {
         return "${faDigits(days)} روز تا شارژ دوبارهٔ حجم"
     }
 
+    /**
+     * «۴ دقیقه پیش» style freshness for a unix-seconds timestamp — used on the
+     * per-key «آخرین گزارش» so a number that is a few minutes old (the VPN
+     * reports periodically) never reads as if it were live-broken.
+     */
+    fun relativeAgoLabel(epochSeconds: Long, nowMillis: Long): String {
+        if (epochSeconds <= 0L) return ""
+        val diffMs = nowMillis - epochSeconds * 1000L
+        if (diffMs < 90_000L) return "همین حالا"
+        val minutes = diffMs / 60_000L
+        if (minutes < 60L) return "${faDigits(minutes)} دقیقه پیش"
+        val hours = minutes / 60L
+        if (hours < 24L) return "${faDigits(hours)} ساعت پیش"
+        return "${faDigits(hours / 24L)} روز پیش"
+    }
+
     private const val DAY_MS = 86_400_000L
 }

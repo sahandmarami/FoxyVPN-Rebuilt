@@ -1,10 +1,13 @@
 package com.foxy.keygen
 
+import android.content.Intent
+import android.graphics.Bitmap
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -45,6 +48,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -69,7 +73,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -84,12 +90,17 @@ import com.foxy.keygen.data.FaFormat
 import com.foxy.keygen.data.FxaApiError
 import com.foxy.keygen.data.FxaAuthRepository
 import com.foxy.keygen.data.GistRegistry
+import com.foxy.keygen.data.IoSPortal
 import com.foxy.keygen.data.QuotaKeyCodec
 import com.foxy.keygen.data.formatBytes
 import com.foxy.keygen.data.formatBytesBinary
 import com.foxy.keygen.ui.KeygenTheme
 import com.foxy.keygen.ui.fieldColors
 import com.foxy.keygen.ui.rememberKeygenAccent
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -490,8 +501,13 @@ private fun HomeScreen(
             ) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("ساخت کلید") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("کلیدهای من") })
+                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("iOS") })
             }
-            if (tab == 0) IssueTab(app, accountsVersion) else KeysTab(app)
+            when (tab) {
+                0 -> IssueTab(app, accountsVersion)
+                1 -> KeysTab(app)
+                else -> IoSTab(app)
+            }
         }
     }
 }
@@ -1519,5 +1535,265 @@ private fun formatTime(epochSeconds: Long): String = runCatching {
     java.time.format.DateTimeFormatter.ofPattern("HH:mm", java.util.Locale.US)
         .format(java.time.Instant.ofEpochSecond(epochSeconds).atZone(java.time.ZoneId.systemDefault()))
 }.getOrDefault("")
+
+
+// ---------------- ios portal tab ----------------
+
+/**
+ * تب iOS: از هر کلید معتبر FV1 یک QR و لینک اتصالِ اختصاصی برای iPhone/iPad
+ * می‌سازد (اپ رایگان Happ — بدون NetworkExtension پولی اپل).
+ *
+ * امنیت: کلید کاربر فقط در حافظهٔ همین صفحه زندگی می‌کند و هیچ‌جا ذخیره
+ * نمی‌شود؛ هویت اتصال (pk + UUID) از خود کلید مشتق می‌شود، پس همان کلیدی که
+ * به کاربر داده شده، تنها سازندهٔ تونل اوست.
+ */
+@Composable
+private fun IoSTab(app: KeygenApp) {
+    val accent = rememberKeygenAccent()
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+
+    var keyText by remember { mutableStateOf("") }
+    var nameText by remember { mutableStateOf("") }
+    var nameSourceKey by remember { mutableStateOf<String?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var vlessLink by remember { mutableStateOf("") }
+    var subLink by remember { mutableStateOf("") }
+    var uuidText by remember { mutableStateOf("") }
+    var qr by remember { mutableStateOf<Bitmap?>(null) }
+
+    val normalized = keyText.trim()
+    val shapeOk = IoSPortal.isValidKeyShape(normalized)
+    val signatureOk = shapeOk && QuotaKeyCodec.verifySelf(normalized)
+
+    // کلید عوض شد؟ برچسب کانفیگ را از نامِ داخل خود کلید پر کن (فقط برای کلید جدید)
+    if (shapeOk && nameSourceKey != normalized) {
+        nameText = IoSPortal.keyPayloadName(normalized).orEmpty()
+        nameSourceKey = normalized
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp),
+    ) {
+        Spacer(Modifier.height(8.dp))
+
+        // --- راهنمای سه‌خطی ---
+        Card(
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFEDF3FB)),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Text(
+                    "اتصال iPhone / iPad — کاملاً رایگان",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF1F4E79),
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "۱) کاربر اپ رایگان «Happ» را از App Store نصب می‌کند.",
+                    fontSize = 12.sp,
+                    color = Color(0xFF37505F),
+                )
+                Text(
+                    "۲) در Happ روی «+» می‌زند و QR پایین را اسکن می‌کند — یا لینک اتصال را برایش می‌فرستید تا فقط بازش کند.",
+                    fontSize = 12.sp,
+                    color = Color(0xFF37505F),
+                )
+                Text(
+                    "۳) روی اتصال می‌زند؛ تمام اینترنت گوشی وصل می‌شود (Streisand و Hiddify هم کار می‌کنند).",
+                    fontSize = 12.sp,
+                    color = Color(0xFF37505F),
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "سرور اتصال: ${IoSPortal.HOST} — لبهٔ ابری کلادفلر؛ هیچ سروری در کار نیست.",
+                    fontSize = 10.sp,
+                    color = Color(0xFF97A1AC),
+                )
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        // --- کلید کاربر ---
+        Card(
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Text(
+                    "کلید کاربر را بچسبانید",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF17222C),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = keyText,
+                    onValueChange = { keyText = it },
+                    placeholder = { Text("FV1.…", fontSize = 11.sp) },
+                    textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
+                    colors = fieldColors(accent),
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                    maxLines = 5,
+                )
+                if (normalized.isNotEmpty()) {
+                    Spacer(Modifier.height(4.dp))
+                    val (statusText, statusColor) = when {
+                        signatureOk -> "کلید معتبر است ✓" to Color(0xFF128A56)
+                        shapeOk -> "امضای کلید درست نیست — متن کلید ناقص چسبیده یا دست‌کاری شده" to Color(0xFFB72749)
+                        else -> "این شکلِ کلید FoxyVPN نیست (کلید با FV1. شروع می‌شود)" to Color(0xFFB57A00)
+                    }
+                    Text(statusText, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = statusColor)
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = nameText,
+                    onValueChange = { nameText = it },
+                    label = { Text("اسم کانفیگ (دلخواه — از خود کلید گرفته می‌شود)") },
+                    colors = fieldColors(accent),
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        error = null
+                        if (!signatureOk) {
+                            error = "اول کلید معتبر کاربر را بچسبانید"
+                        } else {
+                            val pk = IoSPortal.portalKey(normalized)
+                            uuidText = IoSPortal.deriveUUID(pk)
+                            vlessLink = IoSPortal.vlessLink(normalized, nameText)
+                            subLink = IoSPortal.subLink(normalized, nameText)
+                            qr = qrBitmap(vlessLink, 620)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(46.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = accent),
+                ) {
+                    Text("ساخت QR برای iPhone", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                }
+                error?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = Color(0xFFB72749), fontSize = 12.sp)
+                }
+            }
+        }
+
+        // --- خروجی: QR + لینک‌ها ---
+        qr?.let { bmp ->
+            Spacer(Modifier.height(12.dp))
+            Card(
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+            ) {
+                Column(
+                    Modifier.fillMaxWidth().padding(14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        "این QR را با Happ اسکن کنید",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF17222C),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = "QR کانفیگ iOS",
+                        modifier = Modifier.size(250.dp),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "شناسهٔ اتصال: $uuidText",
+                        fontSize = 10.sp,
+                        color = Color(0xFF97A1AC),
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(
+                onClick = {
+                    clipboard.setText(AnnotatedString(vlessLink))
+                    Toast.makeText(app, "لینک VLESS کپی شد", Toast.LENGTH_SHORT).show()
+                },
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("کپی لینک اتصال (VLESS)", fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = {
+                    clipboard.setText(AnnotatedString(subLink))
+                    Toast.makeText(app, "لینک ساب‌اسکریپشن کپی شد", Toast.LENGTH_SHORT).show()
+                },
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("کپی لینک ساب‌اسکریپشن (به‌روزرسانی خودکار)", fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    val shareText = "کانفیگ iOS شما (FoxyVPN)\n\n$vlessLink\n\n" +
+                        "اگر Happ نداری: اپ رایگان Happ را از App Store نصب کن، بعد در Happ روی «+» بزن " +
+                        "و همین لینک را اضافه کن — یا QR را از کلیدساز اسکن کن. در پایان دکمهٔ اتصال را بزن."
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, shareText)
+                    }
+                    context.startActivity(Intent.createChooser(send, "ارسال کانفیگ iOS"))
+                },
+                modifier = Modifier.fillMaxWidth().height(46.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = accent),
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
+                Spacer(Modifier.width(6.dp))
+                Text("ارسال کانفیگ برای کاربر", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "هر کلید QR مخصوص خودش را دارد — برای هر کاربر از کلید همان کاربر QR بساز. " +
+                "این تب هیچ کلیدی را ذخیره نمی‌کند. تونل iOS از لبهٔ ابری کلادفلر می‌گذرد و مصرفش به سهمیهٔ اکانت گره نیست.",
+            fontSize = 10.sp,
+            color = Color(0xFF97A1AC),
+        )
+        Spacer(Modifier.height(20.dp))
+    }
+}
+
+/** QR کد با رنگ برند (تیره روی سفید) — برای اسکنِ بین‌دستگاهی تمیز و پرکنتراست. */
+private fun qrBitmap(content: String, sizePx: Int): Bitmap {
+    val hints = mapOf(
+        EncodeHintType.MARGIN to 2,
+        EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
+    )
+    val matrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
+    val w = matrix.width
+    val h = matrix.height
+    val pixels = IntArray(w * h)
+    for (y in 0 until h) {
+        for (x in 0 until w) {
+            pixels[y * w + x] = if (matrix[x, y]) 0xFF17222C.toInt() else 0xFFFFFFFF.toInt()
+        }
+    }
+    return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+}
 
 

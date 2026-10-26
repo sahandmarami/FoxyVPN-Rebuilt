@@ -58,8 +58,8 @@ android {
         applicationId = "com.foxy.keygen"
         minSdk = 26
         targetSdk = 34
-        versionCode = 11
-        versionName = "2.3.2"
+        versionCode = 12
+        versionName = "2.4.0"
         buildConfigField("String", "FOXY_PRIVATE_KEY", "\"$foxyPrivateKey\"")
     }
 
@@ -118,4 +118,7 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
+    // QR کانفیگ iOS (تب iOS) — core خالص جاوا، بدون هیچ وابستگی اندرویدی
+    implementation("com.google.zxing:core:3.5.3")
 }

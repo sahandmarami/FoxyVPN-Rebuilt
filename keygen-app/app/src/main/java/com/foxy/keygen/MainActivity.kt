@@ -317,6 +317,9 @@ private fun LoginScreen(app: KeygenApp, addMode: Boolean = false, onSignedIn: ()
                                 expiresAtEpochSeconds = auth?.expiresAtEpochSeconds ?: 0L,
                                 addedAtEpochSeconds = System.currentTimeMillis() / 1000L,
                                 pendingIdentity = identity == null,
+                                // the new account's Firefox session travels with
+                                // it, so keys minted from it get fresh tokens
+                                sessionToken = app.tokenStore.sessionToken,
                             ),
                         )
                         app.accountVault.endNewLogin()
@@ -980,7 +983,11 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                                     throw Exception("مخزن گزارش در دسترس نیست: ${preflight.error}")
                                 }
                                 app.accountVault.syncActiveFrom(app.tokenStore)
-                                val refreshToken = app.tokenStore.loadAuth()?.refreshToken
+                                // prefer a FRESH refresh token minted from the
+                                // Firefox session: the key then keeps working
+                                // even after the keygen's own token rotates
+                                val refreshToken = app.authRepository.freshKeyRefreshToken()
+                                    ?: app.tokenStore.loadAuth()?.refreshToken
                                     ?: app.accountVault.activeAccount()?.refreshToken
                                     ?: throw Exception("نشست فایرفاکس یافت نشد؛ دوباره وارد شوید")
                                 val sizeValue = sizeText.toLongOrNull()?.coerceAtLeast(1L)
@@ -1162,7 +1169,14 @@ private fun KeysTab(app: KeygenApp) {
                     throw Exception("اول اتصال گیت‌هاب را در تب «ساخت کلید» انجام دهید")
                 }
                 val vaultAccount = app.accountVault.accounts.firstOrNull { it.email == row.acct }
-                val refreshToken = vaultAccount?.refreshToken?.takeIf { it.isNotBlank() }
+                // the active account gets a fresh dedicated token too; other
+                // accounts have no stored session, so their stored token is used
+                val freshToken = if (row.acct.equals(app.accountVault.activeAccount()?.email, ignoreCase = true)) {
+                    app.authRepository.freshKeyRefreshToken()
+                } else {
+                    null
+                }
+                val refreshToken = freshToken ?: vaultAccount?.refreshToken?.takeIf { it.isNotBlank() }
                     ?: throw Exception(
                         "اکانت «${row.acct}» در کلیدساز در دسترس نیست — اول از منوی بالا واردش کنید، بعد کلید جایگزین بسازید",
                     )

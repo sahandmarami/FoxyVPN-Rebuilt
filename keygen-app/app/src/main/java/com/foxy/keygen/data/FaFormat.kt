@@ -76,7 +76,9 @@ object FaFormat {
         val remainingMs = resetAtEpochSec * 1000L - nowMillis
         if (remainingMs <= 0L) return "حجم ماهانه تازه شد ✓"
         val days = (remainingMs + DAY_MS - 1L) / DAY_MS // rounded up, at least 1
-        return "${faDigits(days)} روز تا شارژ دوبارهٔ حجم"
+        val date = formatJalaliDate(resetAtEpochSec)
+        return if (date.isBlank()) "${faDigits(days)} روز تا شارژ دوبارهٔ حجم"
+        else "${faDigits(days)} روز تا شارژ دوبارهٔ حجم — ریست حجم: $date"
     }
 
     /**

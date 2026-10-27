@@ -59,6 +59,22 @@ class TokenStore(context: Context) {
             }
         }
 
+    /**
+     * The signed-in account's Firefox session token, kept after the login
+     * completes so the keymaker can mint a FRESH, dedicated refresh token
+     * for every FoxyVPN key it issues (see FxaAuthRepository
+     * [freshKeyRefreshToken]). Same encrypted file as the rest.
+     */
+    var sessionToken: String?
+        get() = prefs.getString(KEY_SESSION_TOKEN, null)?.takeIf { it.isNotBlank() }
+        set(value) {
+            if (value != null) {
+                prefs.edit().putString(KEY_SESSION_TOKEN, value).apply()
+            } else {
+                prefs.edit().remove(KEY_SESSION_TOKEN).apply()
+            }
+        }
+
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -68,6 +84,7 @@ class TokenStore(context: Context) {
         private const val KEY_REFRESH_TOKEN = "refresh_token"
         private const val KEY_EXPIRES_AT = "expires_at"
         private const val KEY_PENDING_SESSION_TOKEN = "pending_session_token"
+        private const val KEY_SESSION_TOKEN = "session_token"
 
         private const val CLOCK_SKEW_TOLERANCE_SECONDS = 60L
     }

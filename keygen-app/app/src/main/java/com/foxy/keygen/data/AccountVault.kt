@@ -33,6 +33,12 @@ class AccountVault(context: Context) {
         val addedAtEpochSeconds: Long = 0L,
         /** True while the real e-mail could not be resolved yet. */
         val pendingIdentity: Boolean = false,
+        /**
+         * This account's Firefox session token, when the keygen signed in to
+         * it — lets every key minted from this account get a FRESH dedicated
+         * refresh token instead of sharing the account's own one.
+         */
+        val sessionToken: String? = null,
     )
 
     private val masterKey = MasterKey.Builder(context)
@@ -67,6 +73,7 @@ class AccountVault(context: Context) {
                     expiresAtEpochSeconds = o.optLong("expires"),
                     addedAtEpochSeconds = o.optLong("added"),
                     pendingIdentity = o.optBoolean("pending", false),
+                    sessionToken = o.optString("session").takeIf { it.isNotBlank() },
                 )
             }.let(::dedupe)
         }.getOrElse { emptyList() }
@@ -99,13 +106,14 @@ class AccountVault(context: Context) {
     }
 
     /** Replaces the stored tokens of [email] (e.g. after a refresh grant). */
-    fun updateTokens(email: String, auth: RuntimeAuth) {
+    fun updateTokens(email: String, auth: RuntimeAuth, sessionToken: String? = null) {
         val email = email.trim().lowercase()
         val updated = accounts.map {
             if (it.email == email) it.copy(
                 accessToken = auth.accessToken,
                 refreshToken = auth.refreshToken ?: it.refreshToken,
                 expiresAtEpochSeconds = auth.expiresAtEpochSeconds,
+                sessionToken = sessionToken ?: it.sessionToken,
             ) else it
         }
         persist(updated)
@@ -231,6 +239,9 @@ class AccountVault(context: Context) {
                 expiresAtEpochSeconds = account.expiresAtEpochSeconds,
             ),
         )
+        // the live session token must follow the account: a stale token of
+        // another account must never mint keys for this one
+        tokenStore.sessionToken = account.sessionToken
         activeEmail = account.email
         return true
     }
@@ -240,7 +251,7 @@ class AccountVault(context: Context) {
         if (loginInProgress) return // the live session belongs to a brand-new login
         val auth = tokenStore.loadAuth() ?: return
         val email = activeEmail.ifBlank { return }
-        updateTokens(email, auth)
+        updateTokens(email, auth, tokenStore.sessionToken)
     }
 
     /**
@@ -286,7 +297,8 @@ class AccountVault(context: Context) {
                     .put("refresh", a.refreshToken.orEmpty())
                     .put("expires", a.expiresAtEpochSeconds)
                     .put("added", a.addedAtEpochSeconds)
-                    .put("pending", a.pendingIdentity),
+                    .put("pending", a.pendingIdentity)
+                    .put("session", a.sessionToken.orEmpty()),
             )
         }
         prefs.edit().putString(KEY_ACCOUNTS, arr.toString()).apply()

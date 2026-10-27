@@ -48,7 +48,7 @@ class GuardianClient(
                     ?: jwtExpiryEpochSeconds(token),
                 quotaMax = resp.header("X-Quota-Limit")?.toLongOrNull(),
                 quotaRemaining = resp.header("X-Quota-Remaining")?.toLongOrNull(),
-                quotaReset = resp.header("X-Quota-Reset")?.toLongOrNull(),
+                quotaReset = parseQuotaReset(resp.header("X-Quota-Reset")),
             )
         }
     }
@@ -88,7 +88,6 @@ class GuardianClient(
     private fun parseEntitlement(body: JSONObject): Entitlement = Entitlement(
         subscribed = body.optBoolean("subscribed", false),
         uid = body.optString("uid", ""),
-
         maxBytes = if (body.has("maxBytes") && !body.isNull("maxBytes")) {
             body.optLong("maxBytes", -1L).takeIf { it >= 0 }
         } else {
@@ -96,6 +95,32 @@ class GuardianClient(
         },
         limitedBandwidth = body.optBoolean("limited_bandwidth", false),
     )
+
+    /**
+     * X-Quota-Reset arrives either as unix seconds or as an RFC 3339 instant
+     * («2026-11-26T18:00:00.000Z») — Mozilla's own client accepts both. The
+     * previous release read the header with toLongOrNull() only, so whenever
+     * Guardian answered with an instant the reset date was silently lost and
+     * the quota card never showed the recharge day. Epoch millis are
+     * normalised too.
+     */
+    private fun parseQuotaReset(raw: String?): Long? {
+        val value = raw?.trim().orEmpty()
+        if (value.isEmpty()) return null
+        value.toLongOrNull()?.let { n ->
+            return when {
+                n > 1_000_000_000_000L -> n / 1000L   // epoch milliseconds
+                n > 1_000_000_000L -> n               // epoch seconds
+                else -> null
+            }
+        }
+        return runCatching { java.time.Instant.parse(value).epochSecond }.getOrNull()
+            ?: runCatching {
+                // tolerate an instant without a zone — treat it as UTC
+                java.time.LocalDateTime.parse(value)
+                    .toInstant(java.time.ZoneOffset.UTC).epochSecond
+            }.getOrNull()
+    }
 
     /**
      * Account status + the metered-quota headers of a fresh proxy pass.

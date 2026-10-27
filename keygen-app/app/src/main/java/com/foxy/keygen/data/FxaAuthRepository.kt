@@ -249,6 +249,27 @@ class FxaAuthRepository(
         null
     }
 
+    /**
+     * A FRESH refresh token for the active account, minted straight from the
+     * stored Firefox session — this is what a new FoxyVPN key embeds.
+     *
+     * Why: the keygen regularly refreshes ITS own copy of the account's
+     * refresh token (quota fetches), and FxA rotates tokens — the token that
+     * was baked into older keys then dies inside them, and clients answer
+     * «فایرفاکس توکن داخل کلید را نپذیرفت». Minting every key its own token
+     * from the session decouples the key from the keygen's token lifecycle.
+     * Returns null when no session is stored or FxA refuses; the caller then
+     * falls back to the stored refresh token like before.
+     */
+    suspend fun freshKeyRefreshToken(): String? {
+        val sessionToken = tokenStore.sessionToken ?: return null
+        return runCatching {
+            oauthToken(sessionToken).optString("refresh_token", "").takeIf { it.isNotBlank() }
+        }.onFailure {
+            AppLogger.w(TAG, "could not mint a fresh refresh token for the key", it)
+        }.getOrNull()
+    }
+
     private fun FxaApiError.isPermanentRefreshRejection(): Boolean {
         return statusCode == 400 || statusCode == 401 || statusCode == 403
     }
@@ -268,6 +289,10 @@ class FxaAuthRepository(
                 expiresAtEpochSeconds = expiryFrom(tokenData),
             ),
         )
+        // keep the Firefox session: the keymaker mints every key a FRESH
+        // refresh token from it, so a key's token never dies because the
+        // keygen itself refreshed its own copy later
+        tokenStore.sessionToken = sessionToken
         notifyAuthSaved(usedRefreshToken = null)
         clearPendingSession()
     }

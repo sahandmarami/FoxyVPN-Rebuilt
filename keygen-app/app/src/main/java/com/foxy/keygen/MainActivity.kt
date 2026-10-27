@@ -1,13 +1,10 @@
 package com.foxy.keygen
 
-import android.content.Intent
-import android.graphics.Bitmap
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -48,7 +45,6 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -73,9 +69,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -90,17 +84,11 @@ import com.foxy.keygen.data.FaFormat
 import com.foxy.keygen.data.FxaApiError
 import com.foxy.keygen.data.FxaAuthRepository
 import com.foxy.keygen.data.GistRegistry
-import com.foxy.keygen.data.IoSPortal
 import com.foxy.keygen.data.QuotaKeyCodec
-import com.foxy.keygen.data.formatBytes
 import com.foxy.keygen.data.formatBytesBinary
 import com.foxy.keygen.ui.KeygenTheme
 import com.foxy.keygen.ui.fieldColors
 import com.foxy.keygen.ui.rememberKeygenAccent
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.EncodeHintType
-import com.google.zxing.qrcode.QRCodeWriter
-import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -504,12 +492,10 @@ private fun HomeScreen(
             ) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("ساخت کلید") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("کلیدهای من") })
-                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("iOS") })
             }
             when (tab) {
                 0 -> IssueTab(app, accountsVersion)
-                1 -> KeysTab(app, accountsVersion)
-                else -> IoSTab(app)
+                else -> KeysTab(app, accountsVersion)
             }
         }
     }
@@ -545,9 +531,6 @@ private fun describeQuotaFailure(failure: Throwable): String {
     }
 }
 
-/** Below this gap the «گزارش‌نشده» note is just noise — not worth a line. */
-private const val UNACCOUNTED_VISIBLE_BYTES = 10_000_000L
-
 /**
  * Does this usage report belong to the CURRENT monthly period?
  *
@@ -573,22 +556,8 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
     val activeEmail = remember(accountsVersion) { app.accountVault.activeAccount()?.email.orEmpty() }
     var maxBytes by remember { mutableStateOf<Long?>(null) }
     var remaining by remember { mutableStateOf<Long?>(null) }
-    var resetAt by remember { mutableStateOf<Long?>(null) }
-    // total usage the keys THEMSELVES reported into the gist — compared against
-    // Mozilla's own account counter so the un-reported remainder (old app
-    // versions / other devices) is visible instead of looking like a broken 0
-    var reportedBytes by remember { mutableStateOf<Long?>(null) }
     // the REAL reason of the last failure — never a blanket «اتصال را بررسی کنید»
     var errText by remember { mutableStateOf<String?>(null) }
-    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-
-    // live clock so the recharge countdown falls on its own
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(30_000L)
-            nowMs = System.currentTimeMillis()
-        }
-    }
 
     LaunchedEffect(activeEmail) {
         // this loop belongs to ONE account: if the user switches away, the
@@ -600,11 +569,9 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
         app.accountVault.quotaSnapshot(myEmail)?.let { snap ->
             maxBytes = snap.maxBytes
             remaining = snap.remainingBytes
-            resetAt = snap.resetAtEpochSeconds.takeIf { it > 0L }
         } ?: run {
             maxBytes = null
             remaining = null
-            resetAt = null
         }
         errText = null
         var first = true
@@ -631,7 +598,6 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                         if (app.accountVault.activeAccount()?.email != myEmail) return@onSuccess
                         maxBytes = info.maxBytes
                         remaining = info.quotaRemaining
-                        resetAt = info.quotaReset?.takeIf { it > 0L }
                         errText = null
                         // remember per-account numbers: the next switch shows
                         // them instantly, and the reset date reaches the keys
@@ -671,19 +637,6 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
             } else if (first) {
                 errText = "نشست فعالی برای این اکانت نیست — دوباره واردش شوید"
             }
-            // sum the gist-reported usage of THIS account's keys (clients that
-            // do report); never-reported or previous-period rows count as 0
-            runCatching {
-                val all = app.gistRegistry.fetchRows()
-                if (all.isNotEmpty()) {
-                    val mine = all.filter { it.acct == myEmail }
-                    val pool = if (mine.isNotEmpty()) mine else all
-                    val nowSec = System.currentTimeMillis() / 1000L
-                    reportedBytes = pool.sumOf { row ->
-                        if (isReportStale(row, nowSec) || row.revoked) 0L else row.usedBytes
-                    }
-                }
-            }
             first = false
             delay(60_000L)
         }
@@ -697,7 +650,9 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
     ) {
-        // compact card: used / progress / one detail line — nothing else
+        // compact card: used + progress — nothing else. No reset date, no
+        // duplicated remaining, no un-accounted footnote: the user asked for
+        // exactly this («تاریخ انقضای اون ۵۰ گیگ رو نمیخواد بزنی» + «اضافه‌ها رو حذف کن»)
         Column(Modifier.padding(14.dp)) {
             // Mozilla's counter is the authority for the REAL drained quota:
             // used = max - remaining. Leading with it answers «حجم رو حساب نمی‌کنه»
@@ -723,31 +678,6 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                     color = accent,
                     trackColor = Color(0xFFEDF1F5),
                 )
-            }
-            if (errText == null && (remaining != null || resetAt != null)) {
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    buildString {
-                        remaining?.let { append("باقی‌مانده: ${formatBytesBinary(it)}") }
-                        resetAt?.let {
-                            if (isNotEmpty()) append("  ·  ")
-                            append(FaFormat.quotaResetLabel(it, nowMs))
-                        }
-                    },
-                    fontSize = 11.sp,
-                    color = Color(0xFF67737F),
-                )
-            }
-            reportedBytes?.let { rep ->
-                val unaccounted = (usedBytes ?: 0L) - rep
-                if (unaccounted > UNACCOUNTED_VISIBLE_BYTES) {
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        "≈ ${formatBytesBinary(unaccounted)} مصرفِ ثبت‌نشده — دستگاه‌های دیگر",
-                        fontSize = 10.sp,
-                        color = Color(0xFFB57A00),
-                    )
-                }
             }
             switchError?.let { message ->
                 Spacer(Modifier.height(6.dp))
@@ -952,15 +882,6 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                 error?.let {
                     Spacer(Modifier.height(10.dp))
                     Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-                }
-
-                if (activeAccountEmail.isNotBlank()) {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "از سهمیهٔ اکانت $activeAccountEmail کسر می‌شود",
-                        fontSize = 10.sp,
-                        color = Color(0xFF97A1AC),
-                    )
                 }
 
                 Spacer(Modifier.height(14.dp))
@@ -1428,65 +1349,41 @@ private fun KeyRowCard(
                 fontSize = 11.sp,
                 color = Color(0xFF67737F),
             )
-            // the funding account line is only informative when the key draws
-            // from an account OTHER than the active one (the active account is
-            // already the card on top of the screen)
-            if (row.acct.isNotBlank() && row.acct != activeEmail) {
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    "سهمیه از اکانت ${row.acct}",
-                    fontSize = 10.sp,
-                    color = Color(0xFF97A1AC),
-                )
-            }
             Spacer(Modifier.height(6.dp))
             // Usage belongs to the CURRENT monthly period: a report written a
             // whole period before the next reset boundary is previous-month
             // data (isReportStale) — current reports must always show.
             val stalePeriod = isReportStale(row, nowMs / 1000L)
-            val shownUsed = if (stalePeriod) 0L else row.usedBytes
             if (row.updatedAt == 0L && !row.revoked) {
-                // no client has EVER reported for this key: one short line,
-                // the long explanation was clutter
+                // no client has EVER reported for this key: one short line
                 Text(
-                    "گزارشی از این کلید نرسیده — مصرفش در شمارندهٔ اکانت است",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF67737F),
+                    "مصرف: —",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF97A1AC),
+                )
+            } else if (stalePeriod) {
+                Text(
+                    "مصرف ماه قبل: ${formatBytesBinary(row.usedBytes)}",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF97A1AC),
                 )
             } else {
                 Text(
-                    "مصرف این ماه: ${formatBytesBinary(shownUsed)}" +
-                        (if (row.updatedAt > 0 && !stalePeriod)
+                    "مصرف: ${formatBytesBinary(row.usedBytes)}" +
+                        (if (row.updatedAt > 0)
                             "  ·  " + FaFormat.relativeAgoLabel(row.updatedAt, nowMs)
                         else ""),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF17222C),
                 )
-                if (stalePeriod) {
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        "ماه جدید با اولین اتصال کاربر شمرده می‌شود",
-                        fontSize = 10.sp,
-                        color = Color(0xFF97A1AC),
-                    )
-                }
-            }
-            // the recharge date lives on the top card for the active account;
-            // repeat it here only for keys drawing from OTHER accounts
-            if (row.reset > 0 && row.acct != activeEmail) {
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    FaFormat.quotaResetLabel(row.reset, nowMs),
-                    fontSize = 10.sp,
-                    color = Color(0xFF97A1AC),
-                )
             }
             if (row.planBytes > 0) {
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
-                    progress = { (shownUsed.toFloat() / row.planBytes.toFloat()).coerceIn(0f, 1f) },
+                    progress = { ((if (stalePeriod) 0L else row.usedBytes).toFloat() / row.planBytes.toFloat()).coerceIn(0f, 1f) },
                     modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
                     color = if (row.revoked) Color(0xFFB72749) else accent,
                     trackColor = Color(0xFFEDF1F5),
@@ -1524,263 +1421,4 @@ private fun KeyRowCard(
         }
     }
 }
-
-// ---------------- ios portal tab ----------------
-
-/**
- * تب iOS: از هر کلید معتبر FV1 یک QR و لینک اتصالِ اختصاصی برای iPhone/iPad
- * می‌سازد (اپ رایگان Happ — بدون NetworkExtension پولی اپل).
- *
- * امنیت: کلید کاربر فقط در حافظهٔ همین صفحه زندگی می‌کند و هیچ‌جا ذخیره
- * نمی‌شود؛ هویت اتصال (pk + UUID) از خود کلید مشتق می‌شود، پس همان کلیدی که
- * به کاربر داده شده، تنها سازندهٔ تونل اوست.
- */
-@Composable
-private fun IoSTab(app: KeygenApp) {
-    val accent = rememberKeygenAccent()
-    val clipboard = LocalClipboardManager.current
-    val context = LocalContext.current
-
-    var keyText by remember { mutableStateOf("") }
-    var nameText by remember { mutableStateOf("") }
-    var nameSourceKey by remember { mutableStateOf<String?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var vlessLink by remember { mutableStateOf("") }
-    var subLink by remember { mutableStateOf("") }
-    var uuidText by remember { mutableStateOf("") }
-    var qr by remember { mutableStateOf<Bitmap?>(null) }
-
-    val normalized = keyText.trim()
-    val shapeOk = IoSPortal.isValidKeyShape(normalized)
-    val signatureOk = shapeOk && QuotaKeyCodec.verifySelf(normalized)
-
-    // کلید عوض شد؟ برچسب کانفیگ را از نامِ داخل خود کلید پر کن (فقط برای کلید جدید)
-    if (shapeOk && nameSourceKey != normalized) {
-        nameText = IoSPortal.keyPayloadName(normalized).orEmpty()
-        nameSourceKey = normalized
-    }
-
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp),
-    ) {
-        Spacer(Modifier.height(8.dp))
-
-        // --- راهنمای سه‌خطی ---
-        Card(
-            shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFEDF3FB)),
-        ) {
-            Column(Modifier.padding(12.dp)) {
-                Text(
-                    "اتصال iPhone / iPad — کاملاً رایگان",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF1F4E79),
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "۱) کاربر اپ رایگان «Happ» را از App Store نصب می‌کند.",
-                    fontSize = 12.sp,
-                    color = Color(0xFF37505F),
-                )
-                Text(
-                    "۲) در Happ با «+» این QR را اسکن می‌کند (یا لینک را برایش می‌فرستید).",
-                    fontSize = 12.sp,
-                    color = Color(0xFF37505F),
-                )
-                Text(
-                    "۳) دکمهٔ اتصال را بزند — تمام اینترنت وصل می‌شود.",
-                    fontSize = 12.sp,
-                    color = Color(0xFF37505F),
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "سرور اتصال: ${IoSPortal.HOST} — لبهٔ ابری کلادفلر؛ هیچ سروری در کار نیست.",
-                    fontSize = 10.sp,
-                    color = Color(0xFF97A1AC),
-                )
-            }
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        // --- کلید کاربر ---
-        Card(
-            shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-        ) {
-            Column(Modifier.padding(12.dp)) {
-                Text(
-                    "کلید کاربر را بچسبانید",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF17222C),
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = keyText,
-                    onValueChange = { keyText = it },
-                    placeholder = { Text("FV1.…", fontSize = 11.sp) },
-                    textStyle = LocalTextStyle.current.copy(fontSize = 11.sp),
-                    colors = fieldColors(accent),
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 3,
-                    maxLines = 5,
-                )
-                if (normalized.isNotEmpty()) {
-                    Spacer(Modifier.height(4.dp))
-                    val (statusText, statusColor) = when {
-                        signatureOk -> "کلید معتبر است ✓" to Color(0xFF128A56)
-                        shapeOk -> "امضای کلید درست نیست — متن کلید ناقص چسبیده یا دست‌کاری شده" to Color(0xFFB72749)
-                        else -> "این شکلِ کلید FoxyVPN نیست (کلید با FV1. شروع می‌شود)" to Color(0xFFB57A00)
-                    }
-                    Text(statusText, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = statusColor)
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = nameText,
-                    onValueChange = { nameText = it },
-                    label = { Text("اسم کانفیگ (دلخواه — از خود کلید گرفته می‌شود)") },
-                    colors = fieldColors(accent),
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                )
-                Spacer(Modifier.height(10.dp))
-                Button(
-                    onClick = {
-                        error = null
-                        if (!signatureOk) {
-                            error = "اول کلید معتبر کاربر را بچسبانید"
-                        } else {
-                            val pk = IoSPortal.portalKey(normalized)
-                            uuidText = IoSPortal.deriveUUID(pk)
-                            vlessLink = IoSPortal.vlessLink(normalized, nameText)
-                            subLink = IoSPortal.subLink(normalized, nameText)
-                            qr = qrBitmap(vlessLink, 620)
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth().height(46.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = accent),
-                ) {
-                    Text("ساخت QR برای iPhone", fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                }
-                error?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(it, color = Color(0xFFB72749), fontSize = 12.sp)
-                }
-            }
-        }
-
-        // --- خروجی: QR + لینک‌ها ---
-        qr?.let { bmp ->
-            Spacer(Modifier.height(12.dp))
-            Card(
-                shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-            ) {
-                Column(
-                    Modifier.fillMaxWidth().padding(14.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(
-                        "این QR را با Happ اسکن کنید",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF17222C),
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    Image(
-                        bitmap = bmp.asImageBitmap(),
-                        contentDescription = "QR کانفیگ iOS",
-                        modifier = Modifier.size(250.dp),
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "شناسهٔ اتصال: $uuidText",
-                        fontSize = 10.sp,
-                        color = Color(0xFF97A1AC),
-                        textAlign = TextAlign.Center,
-                    )
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-            OutlinedButton(
-                onClick = {
-                    clipboard.setText(AnnotatedString(vlessLink))
-                    Toast.makeText(app, "لینک VLESS کپی شد", Toast.LENGTH_SHORT).show()
-                },
-                modifier = Modifier.fillMaxWidth().height(44.dp),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("کپی لینک اتصال (VLESS)", fontSize = 13.sp)
-            }
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(
-                onClick = {
-                    clipboard.setText(AnnotatedString(subLink))
-                    Toast.makeText(app, "لینک ساب‌اسکریپشن کپی شد", Toast.LENGTH_SHORT).show()
-                },
-                modifier = Modifier.fillMaxWidth().height(44.dp),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("کپی لینک ساب‌اسکریپشن (به‌روزرسانی خودکار)", fontSize = 13.sp)
-            }
-            Spacer(Modifier.height(8.dp))
-            Button(
-                onClick = {
-                    val shareText = "کانفیگ iOS شما (FoxyVPN)\n\n$vlessLink\n\n" +
-                        "اگر Happ نداری: اپ رایگان Happ را از App Store نصب کن، بعد در Happ روی «+» بزن " +
-                        "و همین لینک را اضافه کن — یا QR را از کلیدساز اسکن کن. در پایان دکمهٔ اتصال را بزن."
-                    val send = Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, shareText)
-                    }
-                    context.startActivity(Intent.createChooser(send, "ارسال کانفیگ iOS"))
-                },
-                modifier = Modifier.fillMaxWidth().height(46.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = accent),
-            ) {
-                Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp), tint = Color.White)
-                Spacer(Modifier.width(6.dp))
-                Text("ارسال کانفیگ برای کاربر", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-        Text(
-            "برای هر کاربر از کلید خودش QR بسازید — این تب هیچ کلیدی را ذخیره نمی‌کند.",
-            fontSize = 10.sp,
-            color = Color(0xFF97A1AC),
-        )
-        Spacer(Modifier.height(20.dp))
-    }
-}
-
-/** QR کد با رنگ برند (تیره روی سفید) — برای اسکنِ بین‌دستگاهی تمیز و پرکنتراست. */
-private fun qrBitmap(content: String, sizePx: Int): Bitmap {
-    val hints = mapOf(
-        EncodeHintType.MARGIN to 2,
-        EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
-    )
-    val matrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
-    val w = matrix.width
-    val h = matrix.height
-    val pixels = IntArray(w * h)
-    for (y in 0 until h) {
-        for (x in 0 until w) {
-            pixels[y * w + x] = if (matrix[x, y]) 0xFF17222C.toInt() else 0xFFFFFFFF.toInt()
-        }
-    }
-    return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
-}
-
 

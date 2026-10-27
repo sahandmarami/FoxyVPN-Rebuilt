@@ -54,8 +54,8 @@ android {
         applicationId = if (freshIdentity) "com.foxy.vpn" else "com.vauth.foxyvpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 110
-        versionName = "3.4.1"
+        versionCode = 111
+        versionName = "3.4.2"
 
         externalNativeBuild {
             ndkBuild {

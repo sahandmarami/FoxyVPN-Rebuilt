@@ -110,10 +110,15 @@ object GistReporter {
     private val WRITE_BACKOFF_STEPS_MS =
         longArrayOf(5L, 15L, 45L, 90L).map { it * 60_000L }.toLongArray()
 
-    /** Minimum gap between two successful usage writes of the same key. */
-    private const val MIN_WRITE_GAP_MS = 3L * 60_000L
+    /**
+     * Minimum gap between two successful usage writes of the same key.
+     * 90 s: the keygen's per-key number stays within ~2 minutes of the app
+     * without getting anywhere near gist write-abuse territory (~40
+     * writes/hour/key only while traffic actually flows).
+     */
+    private const val MIN_WRITE_GAP_MS = 90L * 1000L
     /** Smallest usage delta that justifies an earlier write. */
-    private const val WRITE_DELTA_BYTES = 512L * 1024L
+    private const val WRITE_DELTA_BYTES = 256L * 1024L
     /** Idle connections still refresh their status at this cadence. */
     private const val IDLE_WRITE_HEARTBEAT_MS = 15L * 60_000L
 

@@ -59,6 +59,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -115,8 +117,12 @@ private const val WIFI_LOCK_TAG = "com.vauth.foxyvpn:vpn-wifi"
 
 private const val KEY_SUPERVISION_TICK_MS = 2_000L
 
-/** One gist round trip per interval: revocation check + live usage report. */
-private const val KEY_GIST_SYNC_INTERVAL_MS = 240_000L
+/**
+ * One gist round trip per interval: revocation check + live usage report.
+ * 60 s keeps the distributor's keygen within ~1–2 minutes of this device,
+ * which is what makes the numbers there match the app's own counter.
+ */
+private const val KEY_GIST_SYNC_INTERVAL_MS = 60_000L
 
 /** Revocation re-check budget before opening a new tunnel. */
 private const val CONNECT_GIST_CHECK_TIMEOUT_MS = 8_000L
@@ -1235,9 +1241,9 @@ class FoxyVpnService : VpnService() {
                         return@launch
                     }
                     // one combined round trip: registry (revoked?) + usage report;
-                    // keeps the distributor's dashboard within ~4 min of this
-                    // device — writes are throttled so GitHub never flags the
-                    // gist for abuse again
+                    // keeps the distributor's dashboard within ~1–2 min of this
+                    // device — writes are still throttled so GitHub never flags
+                    // the gist for abuse again
                     if (now - lastSyncAt >= KEY_GIST_SYNC_INTERVAL_MS) {
                         lastSyncAt = now
                         val ctx = UsageAccountant.reporterContext()
@@ -1287,8 +1293,19 @@ class FoxyVpnService : VpnService() {
                     delay(KEY_SUPERVISION_TICK_MS)
                 }
             } finally {
-                // final report so the dashboard shows the last consumed byte
-                runCatching { UsageAccountant.reportNow() }
+                // final report so the dashboard shows the last consumed byte.
+                // Runs on a STANDALONE scope (survives cancellation of this
+                // job) and retries a few times: right after the tunnel drops
+                // the network route often needs a moment to settle, and one
+                // lost flush is exactly the «اختلاف حجم» the user sees in
+                // the keygen.
+                CoroutineScope(Dispatchers.IO).launch {
+                    repeat(3) { attempt ->
+                        val ok = runCatching { UsageAccountant.reportNow() }.getOrDefault(false)
+                        if (ok) return@launch
+                        withContext(NonCancellable) { delay(4_000L * (attempt + 1)) }
+                    }
+                }
             }
         }
     }

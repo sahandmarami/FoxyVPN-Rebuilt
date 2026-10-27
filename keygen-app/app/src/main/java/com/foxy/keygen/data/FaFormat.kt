@@ -24,6 +24,12 @@ object FaFormat {
 
     fun faDigits(n: Int): String = faDigits(n.toLong())
 
+    fun faDigits(s: String): String = buildString {
+        for (ch in s) {
+            append(if (ch in '0'..'9') ('۰'.code + (ch - '0')).toChar() else ch)
+        }
+    }
+
     /** Gregorian → Jalali. Returns (jy, jm, jd). */
     fun toJalali(gy: Int, gm: Int, gd: Int): Triple<Int, Int, Int> {
         val gDaysInMonth = intArrayOf(0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
@@ -52,6 +58,14 @@ object FaFormat {
         "${faDigits(jd)} ${JALALI_MONTHS[jm - 1]} ${faDigits(jy)}"
     }.getOrDefault("")
 
+    /** "۱ آبان ۱۴۰۵، ساعت ۰۳:۳۰" — the exact real moment, device timezone. */
+    fun formatJalaliDateTime(epochSeconds: Long): String = runCatching {
+        val date = Instant.ofEpochSecond(epochSeconds).atZone(ZoneId.systemDefault())
+        val (jy, jm, jd) = toJalali(date.year, date.monthValue, date.dayOfMonth)
+        val clock = String.format(java.util.Locale.US, "%02d:%02d", date.hour, date.minute)
+        "${faDigits(jd)} ${JALALI_MONTHS[jm - 1]} ${faDigits(jy)}، ساعت ${faDigits(clock)}"
+    }.getOrDefault("")
+
     /**
      * Human "time left" label with the granularity the user asked for:
      * days while days remain, hours while hours remain, minutes at the end —
@@ -71,14 +85,21 @@ object FaFormat {
         }
     }
 
-    /** Only the number of days left until the monthly volume is re-granted. */
+    /**
+     * The REAL moment the monthly volume is re-granted — straight from
+     * Mozilla's own X-Quota-Reset answer for THIS account — shown with its
+     * exact clock time («حجم ریست می‌شود: ۱ آبان ۱۴۰۵، ساعت ۰۳:۳۰ (۵ روز دیگر)»)
+     * so the date is verifiable, not a bare countdown. Mozilla re-grants every
+     * account on the same monthly calendar boundary, so two accounts showing
+     * the same moment is the real answer, not a bug.
+     */
     fun quotaResetLabel(resetAtEpochSec: Long, nowMillis: Long): String {
         val remainingMs = resetAtEpochSec * 1000L - nowMillis
         if (remainingMs <= 0L) return "حجم ماهانه تازه شد ✓"
         val days = (remainingMs + DAY_MS - 1L) / DAY_MS // rounded up, at least 1
-        val date = formatJalaliDate(resetAtEpochSec)
-        return if (date.isBlank()) "${faDigits(days)} روز تا شارژ دوبارهٔ حجم"
-        else "${faDigits(days)} روز تا شارژ دوبارهٔ حجم — ریست حجم: $date"
+        val exact = formatJalaliDateTime(resetAtEpochSec)
+        return if (exact.isBlank()) "${faDigits(days)} روز دیگر حجم ریست می‌شود"
+        else "حجم ریست می‌شود: $exact (${faDigits(days)} روز دیگر)"
     }
 
     /**

@@ -58,8 +58,8 @@ android {
         applicationId = "com.foxy.keygen"
         minSdk = 26
         targetSdk = 34
-        versionCode = 13
-        versionName = "2.4.1"
+        versionCode = 14
+        versionName = "2.5.0"
         buildConfigField("String", "FOXY_PRIVATE_KEY", "\"$foxyPrivateKey\"")
     }
 

@@ -508,7 +508,7 @@ private fun HomeScreen(
             }
             when (tab) {
                 0 -> IssueTab(app, accountsVersion)
-                1 -> KeysTab(app)
+                1 -> KeysTab(app, accountsVersion)
                 else -> IoSTab(app)
             }
         }
@@ -547,6 +547,25 @@ private fun describeQuotaFailure(failure: Throwable): String {
 
 /** Below this gap the «گزارش‌نشده» note is just noise — not worth a line. */
 private const val UNACCOUNTED_VISIBLE_BYTES = 10_000_000L
+
+/**
+ * Does this usage report belong to the CURRENT monthly period?
+ *
+ * The registry's `reset` field carries the NEXT quota-reset moment (v2.4.x
+ * stamps Mozilla's future X-Quota-Reset on every key of the account). The
+ * previous release compared updatedAt < reset directly — with a future
+ * boundary that is true for EVERY current report, so the per-key usage
+ * always displayed as 0 B. A report counts as previous-period only when it
+ * was written a whole period before the boundary (Mozilla re-grants
+ * calendar-monthly; the clients pave a 30-day cycle, hence 31 days of
+ * tolerance). Rows still carrying an older past-timestamped boundary keep
+ * the classic comparison.
+ */
+private fun isReportStale(row: GistRegistry.KeyRow, nowEpochSeconds: Long): Boolean {
+    if (row.reset <= 0L || row.updatedAt <= 0L) return false
+    val periodStart = if (row.reset > nowEpochSeconds) row.reset - 31L * 86_400L else row.reset
+    return row.updatedAt < periodStart
+}
 
 @Composable
 private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: String?) {
@@ -659,9 +678,9 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                 if (all.isNotEmpty()) {
                     val mine = all.filter { it.acct == myEmail }
                     val pool = if (mine.isNotEmpty()) mine else all
+                    val nowSec = System.currentTimeMillis() / 1000L
                     reportedBytes = pool.sumOf { row ->
-                        val stale = row.reset > 0 && row.updatedAt > 0 && row.updatedAt < row.reset
-                        if (stale || row.revoked) 0L else row.usedBytes
+                        if (isReportStale(row, nowSec) || row.revoked) 0L else row.usedBytes
                     }
                 }
             }
@@ -678,13 +697,8 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
     ) {
+        // compact card: used / progress / one detail line — nothing else
         Column(Modifier.padding(14.dp)) {
-            Text(
-                if (activeEmail.isBlank()) "سهمیهٔ اکانت" else "سهمیهٔ اکانت $activeEmail",
-                fontSize = 12.sp,
-                color = Color(0xFF67737F),
-            )
-            Spacer(Modifier.height(4.dp))
             // Mozilla's counter is the authority for the REAL drained quota:
             // used = max - remaining. Leading with it answers «حجم رو حساب نمی‌کنه»
             val usedBytes = if (remaining != null && maxBytes != null) {
@@ -697,18 +711,10 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                         remaining != null -> "باقی‌مانده: ${formatBytesBinary(remaining!!)}"
                         else -> "…"
                     },
-                fontSize = 15.sp,
+                fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
                 color = if (errText != null) Color(0xFFB72749) else Color(0xFF17222C),
             )
-            if (remaining != null && usedBytes != null) {
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    "باقی‌مانده: ${formatBytesBinary(remaining!!)}",
-                    fontSize = 11.sp,
-                    color = Color(0xFF67737F),
-                )
-            }
             if (usedBytes != null && maxBytes != null && maxBytes!! > 0) {
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
@@ -718,33 +724,30 @@ private fun AccountQuotaCard(app: KeygenApp, accountsVersion: Int, switchError: 
                     trackColor = Color(0xFFEDF1F5),
                 )
             }
-            reportedBytes?.let { rep ->
+            if (errText == null && (remaining != null || resetAt != null)) {
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "گزارش کلیدها: ${formatBytes(rep)}",
+                    buildString {
+                        remaining?.let { append("باقی‌مانده: ${formatBytesBinary(it)}") }
+                        resetAt?.let {
+                            if (isNotEmpty()) append("  ·  ")
+                            append(FaFormat.quotaResetLabel(it, nowMs))
+                        }
+                    },
                     fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (rep > 0) Color(0xFF128A56) else Color(0xFF97A1AC),
+                    color = Color(0xFF67737F),
                 )
+            }
+            reportedBytes?.let { rep ->
                 val unaccounted = (usedBytes ?: 0L) - rep
                 if (unaccounted > UNACCOUNTED_VISIBLE_BYTES) {
-                    Spacer(Modifier.height(2.dp))
+                    Spacer(Modifier.height(3.dp))
                     Text(
-                        "≈ ${formatBytesBinary(unaccounted)} گزارش‌نشده — ترافیک دستگاه‌های دیگر یا اپ‌های قدیمی؛ " +
-                            "موزیلا آن را از سهمیهٔ همین اکانت کم می‌کند ولی در گزارش کلیدها نیست",
+                        "≈ ${formatBytesBinary(unaccounted)} مصرفِ ثبت‌نشده — دستگاه‌های دیگر",
                         fontSize = 10.sp,
                         color = Color(0xFFB57A00),
                     )
                 }
-            }
-            resetAt?.let { reset ->
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    FaFormat.quotaResetLabel(reset, nowMs),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF67737F),
-                )
             }
             switchError?.let { message ->
                 Spacer(Modifier.height(6.dp))
@@ -798,7 +801,7 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                 Text("۱) اتصال گزارش زنده (گیت‌هاب)", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF17222C))
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "یک توکن GitHub با دسترسی Gist بسازید و اینجا وارد کنید تا مصرف کاربران به‌صورت زنده در تب «کلیدهای من» دیده شود.",
+                    "توکن GitHub (با دسترسی Gist) را وارد کنید تا مصرف کاربران زنده دیده شود.",
                     fontSize = 11.sp,
                     color = Color(0xFF67737F),
                 )
@@ -954,7 +957,7 @@ private fun IssueTab(app: KeygenApp, accountsVersion: Int) {
                 if (activeAccountEmail.isNotBlank()) {
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "کلید از سهمیهٔ اکانت «$activeAccountEmail» کسر می‌شود — با منوی بالای صفحه عوضش کنید",
+                        "از سهمیهٔ اکانت $activeAccountEmail کسر می‌شود",
                         fontSize = 10.sp,
                         color = Color(0xFF97A1AC),
                     )
@@ -1115,7 +1118,7 @@ private suspend fun fetchFxaProfileEmail(accessToken: String): String? = withCon
 // ---------------- keys tab ----------------
 
 @Composable
-private fun KeysTab(app: KeygenApp) {
+private fun KeysTab(app: KeygenApp, accountsVersion: Int) {
     val accent = rememberKeygenAccent()
     val scope = rememberCoroutineScope()
     var rows by remember { mutableStateOf<List<GistRegistry.KeyRow>>(emptyList()) }
@@ -1125,9 +1128,9 @@ private fun KeysTab(app: KeygenApp) {
     var deleteTarget by remember { mutableStateOf<GistRegistry.KeyRow?>(null) }
     var repoOk by remember { mutableStateOf<Boolean?>(null) }
     var repoText by remember { mutableStateOf("") }
-    var writeProbeBusy by remember { mutableStateOf(false) }
     var reissuedKey by remember { mutableStateOf<String?>(null) }
     val clipboard = LocalClipboardManager.current
+    val activeEmail = remember(accountsVersion) { app.accountVault.activeAccount()?.email.orEmpty() }
 
     fun refresh() {
         scope.launch {
@@ -1241,32 +1244,17 @@ private fun KeysTab(app: KeygenApp) {
                 Icon(Icons.Filled.Refresh, contentDescription = "بازخوانی", tint = accent)
             }
         }
-        if (repoOk != null && repoText.isNotBlank()) {
+        if (repoOk == false && repoText.isNotBlank()) {
+            // silence when healthy — the green «مخزن متصل است ✓» line was clutter
             Text(
                 repoText,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold,
-                color = if (repoOk == true) Color(0xFF128A56) else Color(0xFFB57A00),
+                color = Color(0xFFB57A00),
             )
             Spacer(Modifier.height(4.dp))
         }
         Spacer(Modifier.height(8.dp))
-        OutlinedButton(
-            onClick = {
-                writeProbeBusy = true
-                scope.launch {
-                    val (ok, probeError) = app.gistRegistry.writeProbe()
-                    writeProbeBusy = false
-                    repoOk = ok
-                    repoText = if (ok) "نوشتن در مخزن سالم است ✓" else (probeError ?: "نوشتن در مخزن ناموفق بود")
-                }
-            },
-            enabled = !writeProbeBusy && app.gistRegistry.isReady,
-            shape = RoundedCornerShape(10.dp),
-        ) {
-            Text(if (writeProbeBusy) "در حال تست نوشتن…" else "تست نوشتن در مخزن", fontSize = 12.sp)
-        }
-        Spacer(Modifier.height(2.dp))
         if (loading && rows.isEmpty()) {
             Box(Modifier.fillMaxWidth().padding(30.dp), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(color = accent, modifier = Modifier.size(26.dp), strokeWidth = 2.dp)
@@ -1286,6 +1274,7 @@ private fun KeysTab(app: KeygenApp) {
             rows.forEach { row ->
                 KeyRowCard(
                     row = row,
+                    activeEmail = activeEmail,
                     busy = busyId == row.id,
                     onToggle = {
                         busyId = row.id
@@ -1375,6 +1364,7 @@ private fun KeysTab(app: KeygenApp) {
 @Composable
 private fun KeyRowCard(
     row: GistRegistry.KeyRow,
+    activeEmail: String,
     busy: Boolean,
     onToggle: () -> Unit,
     onReissue: () -> Unit,
@@ -1416,7 +1406,32 @@ private fun KeyRowCard(
                     Text(statusText, modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp), fontSize = 11.sp, color = statusColor, fontWeight = FontWeight.SemiBold)
                 }
             }
-            if (row.acct.isNotBlank()) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                buildString {
+                    append(
+                        when {
+                            row.gb > 0 -> "${FaFormat.faDigits(row.gb)} گیگ"
+                            row.mb > 0 -> "${FaFormat.faDigits(row.mb)} مگ"
+                            else -> "نامحدود"
+                        },
+                    )
+                    if (row.exp > 0) {
+                        append("  ·  تا " + FaFormat.formatJalaliDate(row.exp))
+                        if (row.exp * 1000L > nowMs) {
+                            append("  ·  " + FaFormat.remainingLabel(row.exp, nowMs) + " مانده")
+                        } else {
+                            append("  ·  منقضی شده")
+                        }
+                    }
+                },
+                fontSize = 11.sp,
+                color = Color(0xFF67737F),
+            )
+            // the funding account line is only informative when the key draws
+            // from an account OTHER than the active one (the active account is
+            // already the card on top of the screen)
+            if (row.acct.isNotBlank() && row.acct != activeEmail) {
                 Spacer(Modifier.height(2.dp))
                 Text(
                     "سهمیه از اکانت ${row.acct}",
@@ -1425,69 +1440,42 @@ private fun KeyRowCard(
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Text(
-                buildString {
-                    append(
-                        when {
-                            row.gb > 0 -> "${row.gb} گیگابایت"
-                            row.mb > 0 -> "${row.mb} مگابایت"
-                            else -> "نامحدود"
-                        },
-                    )
-                    if (row.exp > 0) {
-                        append("  ·  اعتبار تا " + FaFormat.formatJalaliDate(row.exp))
-                        if (row.exp * 1000L > nowMs) {
-                            append("  ·  " + FaFormat.remainingLabel(row.exp, nowMs) + " مانده")
-                        } else {
-                            append("  ·  اعتبار تمام شده")
-                        }
-                    }
-                },
-                fontSize = 11.sp,
-                color = Color(0xFF67737F),
-            )
-            Spacer(Modifier.height(6.dp))
-            // Usage belongs to the CURRENT monthly period: if the client last
-            // reported before this period's reset stamp, the number shown is
-            // previous-month data and the new month starts from zero.
-            val stalePeriod = row.reset > 0 && row.updatedAt > 0 && row.updatedAt < row.reset
+            // Usage belongs to the CURRENT monthly period: a report written a
+            // whole period before the next reset boundary is previous-month
+            // data (isReportStale) — current reports must always show.
+            val stalePeriod = isReportStale(row, nowMs / 1000L)
             val shownUsed = if (stalePeriod) 0L else row.usedBytes
             if (row.updatedAt == 0L && !row.revoked) {
-                // no client has EVER reported for this key: showing a fake 0 B
-                // read like a broken counter — say plainly where its usage lives
+                // no client has EVER reported for this key: one short line,
+                // the long explanation was clutter
                 Text(
-                    "گزارشی از این کلید نرسیده",
-                    fontSize = 12.sp,
+                    "گزارشی از این کلید نرسیده — مصرفش در شمارندهٔ اکانت است",
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = Color(0xFF67737F),
                 )
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    "اگر در حال استفاده است، مصرفش فقط در شمارندهٔ اکانت (بالای صفحه) دیده می‌شود — دستگاهش هنوز با اپ گزارش‌فرست وصل نشده",
-                    fontSize = 10.sp,
-                    color = Color(0xFF97A1AC),
-                )
             } else {
                 Text(
-                    "مصرف این ماه: ${formatBytes(shownUsed)}" +
+                    "مصرف این ماه: ${formatBytesBinary(shownUsed)}" +
                         (if (row.updatedAt > 0 && !stalePeriod)
-                            "  ·  آخرین گزارش: " + formatTime(row.updatedAt) +
-                            " (" + FaFormat.relativeAgoLabel(row.updatedAt, nowMs) + ")"
+                            "  ·  " + FaFormat.relativeAgoLabel(row.updatedAt, nowMs)
                         else ""),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
                     color = Color(0xFF17222C),
                 )
+                if (stalePeriod) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "ماه جدید با اولین اتصال کاربر شمرده می‌شود",
+                        fontSize = 10.sp,
+                        color = Color(0xFF97A1AC),
+                    )
+                }
             }
-            if (stalePeriod) {
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    "آمار ماه جدید با اولین اتصال کاربر به‌روز می‌شود",
-                    fontSize = 10.sp,
-                    color = Color(0xFF97A1AC),
-                )
-            }
-            if (row.reset > 0) {
+            // the recharge date lives on the top card for the active account;
+            // repeat it here only for keys drawing from OTHER accounts
+            if (row.reset > 0 && row.acct != activeEmail) {
                 Spacer(Modifier.height(2.dp))
                 Text(
                     FaFormat.quotaResetLabel(row.reset, nowMs),
@@ -1533,23 +1521,9 @@ private fun KeyRowCard(
                     Text("حذف کاربر", fontSize = 12.sp)
                 }
             }
-            if (!row.revoked) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "باطل‌سازی در اولین گزارش بعدی روی گوشی کاربر اعمال می‌شود (حدود چند دقیقه)",
-                    fontSize = 10.sp,
-                    color = Color(0xFF97A1AC),
-                )
-            }
         }
     }
 }
-
-private fun formatTime(epochSeconds: Long): String = runCatching {
-    java.time.format.DateTimeFormatter.ofPattern("HH:mm", java.util.Locale.US)
-        .format(java.time.Instant.ofEpochSecond(epochSeconds).atZone(java.time.ZoneId.systemDefault()))
-}.getOrDefault("")
-
 
 // ---------------- ios portal tab ----------------
 
@@ -1613,12 +1587,12 @@ private fun IoSTab(app: KeygenApp) {
                     color = Color(0xFF37505F),
                 )
                 Text(
-                    "۲) در Happ روی «+» می‌زند و QR پایین را اسکن می‌کند — یا لینک اتصال را برایش می‌فرستید تا فقط بازش کند.",
+                    "۲) در Happ با «+» این QR را اسکن می‌کند (یا لینک را برایش می‌فرستید).",
                     fontSize = 12.sp,
                     color = Color(0xFF37505F),
                 )
                 Text(
-                    "۳) روی اتصال می‌زند؛ تمام اینترنت گوشی وصل می‌شود (Streisand و Hiddify هم کار می‌کنند).",
+                    "۳) دکمهٔ اتصال را بزند — تمام اینترنت وصل می‌شود.",
                     fontSize = 12.sp,
                     color = Color(0xFF37505F),
                 )
@@ -1783,8 +1757,7 @@ private fun IoSTab(app: KeygenApp) {
 
         Spacer(Modifier.height(12.dp))
         Text(
-            "هر کلید QR مخصوص خودش را دارد — برای هر کاربر از کلید همان کاربر QR بساز. " +
-                "این تب هیچ کلیدی را ذخیره نمی‌کند. تونل iOS از لبهٔ ابری کلادفلر می‌گذرد و مصرفش به سهمیهٔ اکانت گره نیست.",
+            "برای هر کاربر از کلید خودش QR بسازید — این تب هیچ کلیدی را ذخیره نمی‌کند.",
             fontSize = 10.sp,
             color = Color(0xFF97A1AC),
         )
